@@ -1,0 +1,5 @@
+{
+  "query": "What is the checkout policy?",
+  "hotelId": 5,
+  "topK": 3
+}

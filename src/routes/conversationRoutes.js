@@ -1,20 +1,18 @@
 const express = require('express');
-const router = express.Router();
 const conversationController = require('../controllers/conversationController');
 
-// GET /api/conversations?status=escalated
-router.get('/', conversationController.getEscalatedConversations);
+const router = express.Router();
+
+// GET /api/conversations
+router.get('/', conversationController.getConversations);
 
 // GET /api/conversations/:id/messages
-router.get('/:id/messages', conversationController.getConversationMessages);
+router.get('/:id/messages', conversationController.getMessages);
 
 // POST /api/conversations/:id/human-reply
-router.post('/:id/human-reply', conversationController.postHumanReply);
+router.post('/:id/human-reply', conversationController.humanReply);
 
 // PUT /api/conversations/:id/return-to-ai
-router.put('/:id/return-to-ai', conversationController.putReturnToAI);
-
-// PUT /api/conversations/:id/resolve
-router.put('/:id/resolve', conversationController.putResolveConversation);
+router.put('/:id/return-to-ai', conversationController.returnToAi);
 
 module.exports = router;

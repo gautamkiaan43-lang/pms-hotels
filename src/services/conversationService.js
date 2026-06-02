@@ -23,19 +23,30 @@ class ConversationService {
     return conversation;
   }
 
-  async addMessage(conversationId, senderType, content, channel = 'WhatsApp') {
-    const message = await prisma.message.create({
-      data: {
-        conversationId,
-        senderType,
-        content,
-        channel
-      }
+  async getRecentMessages(conversationId, limit = 10) {
+    const messages = await prisma.message.findMany({
+      where: { conversationId },
+      orderBy: { createdAt: 'desc' },
+      take: limit
     });
+    return messages.reverse(); // Chronological order
+  }
+
+  async addMessage(conversationId, senderType, content, channel = 'WhatsApp', toolCalls = null, toolCallId = null) {
+    const data = {
+      conversationId,
+      senderType,
+      content: content || "",
+      channel
+    };
+    if (toolCalls) data.toolCalls = toolCalls;
+    if (toolCallId) data.toolCallId = toolCallId;
+
+    const message = await prisma.message.create({ data });
 
     await prisma.conversation.update({
       where: { id: conversationId },
-      data: { lastMessage: content }
+      data: { lastMessage: content || "Tool execution in progress..." }
     });
 
     return message;

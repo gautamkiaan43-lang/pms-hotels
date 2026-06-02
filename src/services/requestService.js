@@ -83,9 +83,6 @@ const createRequest = async (data) => {
     { sender: "system", content: "Hotel Setup Request submitted successfully. Awaiting initial super admin review.", timestamp: new Date().toISOString() }
   ];
 
-  const token = crypto.randomBytes(16).toString('hex');
-  const expires = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000); // 7 days expiration
-
   const created = await prisma.onboardingRequest.create({
     data: {
       requestId: reqId,
@@ -104,15 +101,8 @@ const createRequest = async (data) => {
       timeline: JSON.stringify(defaultTimeline),
       messages: JSON.stringify(defaultMessages),
       specialist: 'Unassigned',
-      integrationHealth: 'Pending',
-      onboardingToken: token,
-      tokenExpires: expires
+      integrationHealth: 'Pending'
     }
-  });
-
-  // Dispatch automated acknowledgement email to the client email
-  emailService.sendRequestReceived(created.email, created.hotelName).catch(err => {
-    console.error('Failed to send request acknowledgement email:', err);
   });
 
   return {
@@ -135,7 +125,6 @@ const createRequest = async (data) => {
     integrationHealth: created.integrationHealth,
     notes: created.notes || '',
     date: created.createdAt.toISOString().split('T')[0],
-    onboardingToken: created.onboardingToken,
     operator: { name: created.specialist, role: 'Hospitality Onboarding Specialist' },
     website: created.website || '',
     hotelType: created.hotelType || 'Boutique',
@@ -170,33 +159,6 @@ const updateRequest = async (requestId, updates) => {
   // JSON serialized columns
   if (updates.messages !== undefined) {
     data.messages = JSON.stringify(updates.messages);
-    
-    // Dispatch automated email message to client when Admin posts a comment
-    try {
-      let currentMessages = [];
-      try {
-        currentMessages = currentRequest.messages ? JSON.parse(currentRequest.messages) : [];
-      } catch (e) {
-        currentMessages = [];
-      }
-      
-      const newMessages = updates.messages || [];
-      if (newMessages.length > currentMessages.length) {
-        const lastMsg = newMessages[newMessages.length - 1];
-        if (lastMsg && (lastMsg.sender === 'Super Admin' || lastMsg.sender === 'Platform Operator' || lastMsg.sender === 'Operator')) {
-          console.log(`[EMAIL ROUTER] 📧 Dispatching comment from ${lastMsg.sender} to client email: ${currentRequest.email}`);
-          emailService.sendOnboardingMessage(
-            currentRequest.email,
-            currentRequest.hotelName,
-            lastMsg.sender,
-            lastMsg.text || lastMsg.content || '',
-            currentRequest.onboardingToken
-          ).catch(err => console.error('Failed to send discussion email dispatch:', err));
-        }
-      }
-    } catch (err) {
-      console.error('Error in discussion email trigger:', err);
-    }
   }
   if (updates.checklist !== undefined) {
     data.checklist = JSON.stringify(updates.checklist);
@@ -253,18 +215,6 @@ const updateRequest = async (requestId, updates) => {
         category: "action"
       });
       data.timeline = JSON.stringify(currentTimeline);
-
-      // Dispatch automated onboarding invitation email containing client-specific URL
-      const token = currentRequest.onboardingToken || crypto.randomBytes(16).toString('hex');
-      if (!currentRequest.onboardingToken) {
-        data.onboardingToken = token;
-        data.tokenExpires = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000);
-      }
-
-      console.log(`[EMAIL ROUTER] 📧 Dispatching onboarding invitation to: ${currentRequest.email}`);
-      emailService.sendOnboardingInvite(currentRequest.email, currentRequest.hotelName, token).catch(err => {
-        console.error('Failed to send onboarding invitation email:', err);
-      });
     }
   }
 
@@ -289,37 +239,10 @@ const updateRequest = async (requestId, updates) => {
 
     const workspaceId = currentRequest.uniqueHotelId || data.uniqueHotelId || `hotel_ws_${Math.floor(100 + Math.random() * 900)}`;
 
-    // Parse bank details if present (fallback support, though generally done post-activation now)
-    let bankName = '';
-    let bankRoute = '';
-    let bankNum = '';
-    let billingAddress = 'Main Street Address';
-    let isBankAuth = false;
-    let subStatus = 'Trial';
-
-    if (currentRequest.notes) {
-      if (currentRequest.notes.includes('BANK_AUTH_COMPLETED')) {
-        isBankAuth = true;
-        subStatus = 'Active';
-      }
-
-      const nameMatch = currentRequest.notes.match(/Bank Authorized:\s*(.*?)\s*\|/);
-      if (nameMatch) bankName = nameMatch[1].trim();
-      
-      const routeMatch = currentRequest.notes.match(/Route:\s*(.*?)\s*\|/);
-      if (routeMatch) bankRoute = routeMatch[1].trim();
-      
-      const acctMatch = currentRequest.notes.match(/Acct:\s*(.*?)(?:\n|$)/);
-      if (acctMatch) bankNum = acctMatch[1].trim();
-
-      const addrMatch = currentRequest.notes.match(/Address:\s*(.*?)(?:\n|$)/);
-      if (addrMatch) billingAddress = addrMatch[1].trim();
-    }
-
     // Atomic Transaction: Create Hotel + Create Admin User + Update Request
     await prisma.$transaction(async (tx) => {
-      // Create Hotel Record with billing/subscription fields in Trial/Pending status
-      const newHotel = await tx.hotel.create({
+      // Create Hotel Record
+      await tx.hotel.create({
         data: {
           hotelName: currentRequest.hotelName,
           pmsProvider: currentRequest.pmsProvider,
@@ -332,20 +255,7 @@ const updateRequest = async (requestId, updates) => {
           totalRooms: parseInt(currentRequest.roomCount) || 100,
           pmsApiKey: '[SECURELY_STORED_IN_SECRET_MANAGER]',
           pmsSecret: '[SECURELY_STORED_IN_SECRET_MANAGER]',
-          hotelCode: workspaceId,
-          
-          // SaaS Subscription fields (trial setup first, upgraded on post-activation bank authorization)
-          subscriptionStatus: subStatus,
-          bankAuthorized: isBankAuth,
-          billingCycle: 'Monthly',
-          paymentHealth: 'Healthy',
-          bankAccountName: bankName,
-          bankAccountNumber: bankNum,
-          bankRoutingNumber: bankRoute,
-          billingEmail: currentRequest.email,
-          billingAddress: billingAddress,
-          lastPaymentDate: isBankAuth ? new Date() : null,
-          nextPaymentDate: isBankAuth ? new Date(Date.now() + 30 * 24 * 60 * 60 * 1000) : null
+          hotelCode: workspaceId
         }
       });
 
@@ -358,27 +268,6 @@ const updateRequest = async (requestId, updates) => {
           role: 'Hotel Admin'
         }
       });
-
-      // Defer Invoice Creation: Invoice is generated only when payment method is fully authorized post-activation
-      if (isBankAuth) {
-        const planPrice = currentRequest.plan === 'Starter' ? 199 : currentRequest.plan === 'Pro' || currentRequest.plan === 'Professional' ? 399 : 799;
-        await tx.billingHistory.create({
-          data: {
-            reference: `PAY-${Math.floor(100000 + Math.random() * 900000)}`,
-            hotelName: currentRequest.hotelName,
-            amount: parseFloat(planPrice),
-            status: 'Paid',
-            date: new Date(),
-            hotelId: newHotel.id,
-            planName: currentRequest.plan,
-            paymentMethod: 'Bank Transfer',
-            roomCount: parseInt(currentRequest.roomCount) || 100,
-            usage: 0.0,
-            pdfUrl: `/api/billing/invoices/INV-${newHotel.id}-${Date.now().toString().slice(-4)}/download`,
-            invoiceNumber: `INV-${Math.floor(10000 + Math.random() * 90000)}`
-          }
-        });
-      }
     });
 
     // Send Activation Email

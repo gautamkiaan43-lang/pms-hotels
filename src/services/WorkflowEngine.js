@@ -1,8 +1,8 @@
 const automationEngine = require('./AutomationEngine');
 
 const executeWorkflow = async (context) => {
-  const { sender, message, channel } = context;
-  return await automationEngine.handleIncomingMessage(sender, message, channel);
+  const { hotelId, sender, message, channel } = context;
+  return await automationEngine.handleIncomingMessage(hotelId, sender, message, channel);
 };
 
 module.exports = {

@@ -129,11 +129,6 @@ const deleteUser = asyncHandler(async (req, res) => {
   return sendSuccess(res, 200, result);
 });
 
-const updateUser = asyncHandler(async (req, res) => {
-  const result = await authService.updateUser(req.params.id, req.body);
-  return sendSuccess(res, 200, result);
-});
-
 const getMe = asyncHandler(async (req, res) => {
   const user = await authService.getUserById(req.user.id);
   return sendSuccess(res, 200, { user });
@@ -148,7 +143,6 @@ module.exports = {
   refreshToken,
   getUsers,
   updateUserRole,
-  updateUser,
   deleteUser,
   getMe
 };

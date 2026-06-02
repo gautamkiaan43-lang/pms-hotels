@@ -4,7 +4,6 @@ const mewsController = require('../controllers/mewsController');
 const { requireAuth } = require('../middleware/authMiddleware');
 
 router.get('/test', mewsController.testConnection);
-router.get('/test-connection', mewsController.testConnection);
 router.get('/guest', requireAuth, mewsController.getGuestProfile);
 router.get('/occupancy', requireAuth, mewsController.getOccupancy);
 router.get('/arrivals', requireAuth, mewsController.getArrivals);

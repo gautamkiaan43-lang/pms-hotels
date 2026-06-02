@@ -1,49 +1,94 @@
+const { PrismaClient } = require('@prisma/client');
+const prisma = new PrismaClient();
 const config = require('../config/env');
+const { decrypt } = require('../utils/cryptoUtils');
 
 /**
  * Mews API Service
- * Handles all communication with the Mews PMS API
+ * Handles all communication with the Mews PMS API dynamically per hotel
  */
 class MewsService {
-  constructor() {
-    this.baseUrl = (config.mews.baseUrl || 'https://api.mews-demo.com/api/connector/v1').replace(/\/$/, '');
-    this.clientToken = config.mews.clientToken || '';
-    this.accessToken = config.mews.accessToken || '';
+  /**
+   * Helper to fetch credentials from DB for a specific hotel
+   */
+  async _getHotelCredentials(hotelId) {
+    const hotel = await prisma.hotel.findUnique({ where: { id: hotelId } });
+    if (!hotel) throw new Error(`Hotel with ID ${hotelId} not found`);
+    if (!hotel.pmsApiKey || !hotel.pmsSecret) {
+      throw new Error(`Mews credentials missing for Hotel ID ${hotelId}`);
+    }
+
+    return {
+      baseUrl: (hotel.pmsBaseUrl || config.mews.baseUrl || 'https://api.mews-demo.com/api/connector/v1').replace(/\/$/, ''),
+      clientToken: decrypt(hotel.pmsApiKey),
+      accessToken: decrypt(hotel.pmsSecret)
+    };
   }
 
   /**
-   * Generic request handler for Mews API
+   * Generic request handler for Mews API with Failure Classifier
    */
-  async _request(endpoint, data = {}) {
+  async _request(hotelId, endpoint, data = {}) {
     try {
+      const creds = await this._getHotelCredentials(hotelId);
+
       const payload = {
-        ClientToken: this.clientToken,
-        AccessToken: this.accessToken,
+        ClientToken: creds.clientToken,
+        AccessToken: creds.accessToken,
         ...data
       };
 
       const controller = new AbortController();
       const timeout = setTimeout(() => controller.abort(), 10000);
+      
+      let response;
+      try {
+        response = await fetch(`${creds.baseUrl}${endpoint}`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload),
+          signal: controller.signal
+        });
+      } catch (networkError) {
+        if (networkError.name === 'AbortError') {
+          await prisma.activityLog.create({
+            data: { conversationId: 0, actionType: "AMBIGUOUS_TIMEOUT_DETECTED", actionDetails: `Timeout on ${endpoint}` }
+          });
+          const err = new Error("Mews Timeout: AMBIGUOUS state.");
+          err.classification = "AMBIGUOUS";
+          throw err;
+        }
+        throw networkError;
+      }
 
-      const response = await fetch(`${this.baseUrl}${endpoint}`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify(payload),
-        signal: controller.signal
-      });
-
-      clearTimeout(timeout);
       const result = await response.json();
+      
+      console.log(`\n========================================`);
+      console.log(`📡 [MEWS API REQUEST] -> ${endpoint}`);
+      console.log(`Payload:`, JSON.stringify(data));
+      console.log(`Response Status:`, response.status);
+      console.log(`Response Data:`, JSON.stringify(result).substring(0, 500));
+      console.log(`========================================\n`);
 
       if (!response.ok) {
-        throw new Error(result.Message || `Mews API Error: ${response.status}`);
+        const errorMsg = result.Message || `Mews API Error: ${response.status}`;
+        const err = new Error(errorMsg);
+        if ([502, 503, 504].includes(response.status)) {
+           err.classification = "RETRYABLE";
+           await prisma.activityLog.create({
+             data: { conversationId: 0, actionType: "MEWS_RETRY_CLASSIFIED", actionDetails: `Status ${response.status} on ${endpoint}` }
+           });
+        } else if ([400, 401, 403, 404, 409].includes(response.status)) {
+           err.classification = "NON_RETRYABLE";
+        } else {
+           err.classification = "AMBIGUOUS";
+        }
+        throw err;
       }
 
       return result;
     } catch (error) {
-      console.error(`Mews API Request Failed [${endpoint}]:`, error.message);
+      console.error(`Mews API Request Failed [${endpoint}] for Hotel ${hotelId}:`, error.message);
       throw error;
     }
   }
@@ -51,83 +96,71 @@ class MewsService {
   /**
    * 1. Get Guest Profile
    */
-  async getGuestProfile(email) {
-    try {
-      return await this._request('/customers/getAll', {
-        Emails: [email]
-      });
-    } catch (err) {
-      console.warn('[MEWS SERVICE] getGuestProfile connection fallback:', err.message);
-      return {
-        Customers: [
-          {
-            Id: 'mews-guest-1',
-            FirstName: 'Sarah',
-            LastName: 'Jenkins',
-            Email: email,
-            Telephone: '+49123456789'
-          }
-        ]
-      };
-    }
+  async getGuestProfile(hotelId, email) {
+    return this._request(hotelId, '/customers/getAll', {
+      Emails: [email]
+    });
+  }
+
+  /**
+   * 1b. Create Guest Profile
+   */
+  async addCustomer(hotelId, email, firstName, lastName, phone) {
+    return this._request(hotelId, '/customers/add', {
+      Email: email,
+      FirstName: firstName,
+      LastName: lastName,
+      Telephone: phone
+    });
   }
 
   /**
    * 2. Get Reservation
    */
-  async getReservation(reservationId) {
-    try {
-      return await this._request('/reservations/get', {
-        ReservationIds: [reservationId]
-      });
-    } catch (err) {
-      console.warn('[MEWS SERVICE] getReservation connection fallback:', err.message);
-      return {
-        Reservations: [{ Id: reservationId, State: 'Confirmed' }]
-      };
-    }
+  async getReservation(hotelId, reservationId) {
+    return this._request(hotelId, '/reservations/get', {
+      ReservationIds: [reservationId]
+    });
   }
 
   /**
    * 3. Get Guest Stay Details
    */
-  async getStayDetails(customerId) {
-    try {
-      return await this._request('/reservations/getAll', {
-        CustomerIds: [customerId],
-        States: ['Confirmed', 'CheckedIn', 'CheckedOut']
-      });
-    } catch (err) {
-      console.warn('[MEWS SERVICE] getStayDetails connection fallback:', err.message);
-      return {
-        Reservations: [
-          {
-            Id: 'res-active-1',
-            State: 'CheckedIn',
-            CustomerId: customerId,
-            StartUtc: new Date().toISOString(),
-            EndUtc: new Date(Date.now() + 86400000).toISOString()
-          }
-        ]
-      };
-    }
-  }
-
-  /**
-   * 4. Get Room Availability
-   */
-  async getRoomAvailability(startUtc, endUtc) {
-    return this._request('/resourceBlocks/getAll', {
-      StartUtc: startUtc,
-      EndUtc: endUtc
+  async getStayDetails(hotelId, customerId) {
+    return this._request(hotelId, '/reservations/getAll', {
+      CustomerIds: [customerId],
+      States: ['Confirmed', 'CheckedIn', 'CheckedOut']
     });
   }
 
   /**
-   * 5. Get Arrival/Departure
+   * 4. Update Reservation (e.g. for Late Checkout)
    */
-  async getArrivalsDepartures(startUtc, endUtc) {
-    return this._request('/reservations/getAll', {
+  async updateReservation(hotelId, reservationId, updateData) {
+    // Mews update reservation endpoint. For late checkout, we update EndUtc.
+    return this._request(hotelId, '/reservations/update', {
+      ReservationId: reservationId,
+      ...updateData
+    });
+  }
+
+  /**
+   * 5. Get Room Availability
+   */
+  async getRoomAvailability(hotelId, startUtc, endUtc) {
+    return this._request(hotelId, '/resourceBlocks/getAll', {
+      CollidingUtc: {
+        StartUtc: startUtc,
+        EndUtc: endUtc
+      }
+    });
+  }
+
+  /**
+   * 6. Get Arrival/Departure
+   */
+  async getArrivalsDepartures(hotelId, startUtc, endUtc) {
+    return this._request(hotelId, '/reservations/getAll', {
       StartUtc: startUtc,
       EndUtc: endUtc,
       Extent: {
@@ -138,10 +171,10 @@ class MewsService {
   }
 
   /**
-   * 6. Post Charges To Guest Folio
+   * 7. Post Charges To Guest Folio
    */
-  async postCharge(customerId, amount, currency, serviceId) {
-    return this._request('/orders/create', {
+  async postCharge(hotelId, customerId, amount, currency, serviceId) {
+    return this._request(hotelId, '/orders/create', {
       CustomerId: customerId,
       Items: [{
         ServiceId: serviceId,
@@ -154,22 +187,52 @@ class MewsService {
   }
 
   /**
-   * 7. Create Service Reservation
+   * 8. Create Room Reservation (fetches first available rate automatically)
    */
-  async createServiceReservation(customerId, serviceId, startUtc, endUtc) {
-    return this._request('/reservations/create', {
-      CustomerId: customerId,
-      ServiceId: serviceId,
-      StartUtc: startUtc,
-      EndUtc: endUtc
+  async createRoomReservation(hotelId, customerId, serviceId, startUtc, endUtc) {
+    // Fetch first active rate for this service
+    const ratesRes = await this._request(hotelId, '/rates/getAll', {
+      ServiceIds: [serviceId]
+    });
+    const rates = (ratesRes.Rates || []);
+    if (rates.length === 0) throw new Error('No rate plans found for this room service.');
+    
+    // Prefer "Fully Flexible" or "No-Flex", otherwise use first rate
+    const preferred = rates.find(r => r.Name === 'Fully Flexible') || rates.find(r => r.Name === 'No-Flex') || rates[0];
+    const rateId = preferred.Id;
+    
+    console.log(`Using rate: "${preferred.Name}" [${rateId}]`);
+    
+    return this._request(hotelId, '/reservations/add', {
+      Reservations: [{
+        CustomerId: customerId,
+        ServiceId: serviceId,
+        RateId: rateId,
+        StartUtc: startUtc,
+        EndUtc: endUtc
+      }]
     });
   }
 
   /**
-   * 8. Send Payment Link
+   * 9. Create Service Reservation (spa, breakfast etc.)
    */
-  async sendPaymentLink(customerId, amount, currency) {
-    return this._request('/paymentRequests/create', {
+  async createServiceReservation(hotelId, customerId, serviceId, startUtc, endUtc) {
+    return this._request(hotelId, '/reservations/add', {
+      Reservations: [{
+        CustomerId: customerId,
+        ServiceId: serviceId,
+        StartUtc: startUtc,
+        EndUtc: endUtc
+      }]
+    });
+  }
+
+  /**
+   * 9. Send Payment Link
+   */
+  async sendPaymentLink(hotelId, customerId, amount, currency) {
+    return this._request(hotelId, '/paymentRequests/create', {
       CustomerId: customerId,
       Amount: {
         Currency: currency,
@@ -179,67 +242,49 @@ class MewsService {
   }
 
   /**
-   * 9. Update Guest Notes
+   * 10. Update Guest Notes
    */
-  async updateGuestNotes(customerId, notes) {
-    return this._request('/customers/update', {
+  async updateGuestNotes(hotelId, customerId, notes) {
+    return this._request(hotelId, '/customers/update', {
       CustomerId: customerId,
       Notes: notes
     });
   }
 
   /**
-   * 10. Get Hotel Occupancy
+   * 11. Cancel Reservation
    */
-  async getOccupancy(startUtc, endUtc) {
-    return this._request('/reports/occupancy/get', {
-      StartUtc: startUtc,
-      EndUtc: endUtc
+  async cancelReservation(hotelId, reservationId, reason) {
+    return this._request(hotelId, '/reservations/cancel', {
+      ReservationId: reservationId,
+      Reason: reason
     });
   }
 
   /**
-   * Verify Connection
+   * 12. Get Folio Balance (Unpaid items)
    */
-  async testConnection() {
-    return this._request('/configuration/get', {});
+  async getFolioBalance(hotelId, customerId) {
+    return this._request(hotelId, '/finance/items/getAll', {
+      CustomerIds: [customerId],
+      States: ['Unpaid']
+    });
   }
 
   /**
-   * Verify Dynamic Connection
+   * 13. Get Services
    */
-  async testDynamicConnection(clientToken, accessToken, baseUrl) {
-    const originalBase = this.baseUrl;
-    const originalClient = this.clientToken;
-    const originalAccess = this.accessToken;
+  async getServices(hotelId) {
+    return this._request(hotelId, '/services/getAll', {});
+  }
 
-    try {
-      if (baseUrl) this.baseUrl = baseUrl.replace(/\/$/, '');
-      if (clientToken) this.clientToken = clientToken;
-      if (accessToken) this.accessToken = accessToken;
-
-      // If using dummy, sandbox, or already-masked placeholder keys, bypass request and return mock success
-      if (
-        !clientToken || 
-        clientToken === '••••••••••••••••' || 
-        clientToken.toLowerCase().includes('test') || 
-        clientToken.toLowerCase().includes('demo') || 
-        clientToken.toLowerCase().includes('dummy') ||
-        clientToken.toLowerCase().includes('placeholder')
-      ) {
-        return { Enterprise: { Name: 'Grand Palace Mews Shard (Demo Sync)' } };
-      }
-
-      const result = await this.testConnection();
-      return result;
-    } catch (err) {
-      console.warn('Real Mews connection failed, falling back to mock connection success for dynamic demo compatibility:', err.message);
-      return { Enterprise: { Name: 'Grand Palace Mews Shard (Demo Sync)' } };
-    } finally {
-      this.baseUrl = originalBase;
-      this.clientToken = originalClient;
-      this.accessToken = originalAccess;
-    }
+  /**
+   * 14. Get Rates
+   */
+  async getRates(hotelId, serviceId) {
+    return this._request(hotelId, '/rates/getAll', {
+      ServiceIds: [serviceId]
+    });
   }
 }
 

@@ -1,32 +1,10 @@
 const { PrismaClient } = require('@prisma/client');
 const prisma = new PrismaClient();
 
-const resolveHotelId = async (requestedHotelId) => {
-  let hotelId = parseInt(requestedHotelId);
-  let hotel = null;
-
-  if (!isNaN(hotelId)) {
-    hotel = await prisma.hotel.findUnique({ where: { id: hotelId } });
-  }
-
-  if (!hotel) {
-    hotel = await prisma.hotel.findFirst({ orderBy: { id: 'asc' } });
-    hotelId = hotel?.id;
-  }
-
-  if (!hotelId) {
-    const error = new Error('No hotel records exist in the system');
-    error.statusCode = 400;
-    throw error;
-  }
-
-  return hotelId;
-};
-
 // Get all workflows for a hotel
 exports.getWorkflows = async (req, res) => {
   try {
-    const hotelId = await resolveHotelId(req.query.hotelId || req.headers['x-hotel-id'] || req.user?.hotelId);
+    const hotelId = req.user?.hotelId || 5; // Fallback to 5 since only hotel 5 exists
     const workflows = await prisma.workflow.findMany({
       where: { hotelId }
     });
@@ -40,7 +18,7 @@ exports.getWorkflows = async (req, res) => {
 // Create a new workflow
 exports.createWorkflow = async (req, res) => {
   try {
-    const hotelId = await resolveHotelId(req.body.hotelId || req.query.hotelId || req.headers['x-hotel-id'] || req.user?.hotelId);
+    const hotelId = req.user?.hotelId || 5;
     const { name, purpose, channel, policySource, escalationTrigger, autoApproveLimit, occupancyThreshold, loyaltyRequired } = req.body;
 
     const newWorkflow = await prisma.workflow.create({

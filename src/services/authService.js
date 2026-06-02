@@ -288,33 +288,6 @@ const deleteUser = async (userId) => {
   return { message: 'User deleted successfully' };
 };
 
-const updateUser = async (userId, updates) => {
-  const data = {};
-  if (updates.name) data.name = updates.name;
-  if (updates.email) data.email = updates.email;
-  if (updates.role) data.role = updates.role;
-  if (updates.password) {
-    if (!validatePassword(updates.password)) {
-      const error = new Error('Password must be at least 8 characters long and contain uppercase, lowercase, number, and special character');
-      error.statusCode = 400;
-      throw error;
-    }
-    data.password = await bcrypt.hash(updates.password, 10);
-  }
-
-  const user = await prisma.user.update({
-    where: { id: parseInt(userId) },
-    data,
-    select: {
-      id: true,
-      name: true,
-      email: true,
-      role: true
-    }
-  });
-  return user;
-};
-
 const getUserById = async (userId) => {
   const user = await prisma.user.findUnique({
     where: { id: parseInt(userId) },
@@ -348,7 +321,6 @@ module.exports = {
   refreshAccessToken,
   getUsers,
   updateUserRole,
-  updateUser,
   deleteUser,
   getUserById
 };

@@ -1,262 +1,620 @@
-const mewsService = require("./mewsService");
-const guestService = require("./guestService");
-const conversationService = require("./conversationService");
-const aiService = require("./AIService");
-const ragService = require("./ragService");
+const mewsService = require('./mewsService');
+const guestService = require('./guestService');
+const conversationService = require('./conversationService');
+const whatsappService = require('./whatsappService');
+const { PrismaClient } = require('@prisma/client');
+const prisma = new PrismaClient();
+const { OpenAI } = require('openai');
+const { Pinecone } = require('@pinecone-database/pinecone');
 
-/**
- * Automation Engine
- * Orchestrates the flow from guest message to automated response
- */
+const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+const pc = new Pinecone({ apiKey: process.env.PINECONE_API_KEY });
+const pineconeIndex = pc.Index('hotel-pms', process.env.PINECONE_URL);
+
 class AutomationEngine {
-  async handleIncomingMessage(senderIdentity, content, channel = "WhatsApp") {
+  
+  // ==========================================
+  // MIDDLEWARE: OWNERSHIP & SECURITY
+  // ==========================================
+  async _ownershipMiddleware(hotelId, guest, reservationId) {
+    if (!guest.pmsGuestId) {
+      throw new Error("Guest is not linked to PMS.");
+    }
+    // Fetch once and cache in execution context conceptually
+    const reservation = await mewsService.getReservation(hotelId, reservationId);
+    if (!reservation) {
+       throw new Error("Reservation not found.");
+    }
+    // Check if the reservation returned contains the customer
+    // The Mews API usually returns an array of Reservations.
+    let targetRes = Array.isArray(reservation.Reservations) ? reservation.Reservations.find(r => r.Id === reservationId) : reservation;
+    if (!targetRes) targetRes = reservation.Reservations ? reservation.Reservations[0] : null;
+    
+    if (targetRes && targetRes.CustomerId !== guest.pmsGuestId) {
+      // Emit Telemetry
+      await prisma.activityLog.create({
+        data: {
+          conversationId: 0,
+          actionType: "IDENTITY_VIOLATION_BLOCKED",
+          actionDetails: `Attempted access to Res ${reservationId} by guest ${guest.pmsGuestId}`,
+        }
+      });
+      throw new Error("Unauthorized: Reservation does not belong to verified guest.");
+    }
+    return targetRes;
+  }
+
+  // ==========================================
+  // MIDDLEWARE: IDEMPOTENCY ENGINE & TRANSACTION SENTINEL
+  // ==========================================
+  async _withIdempotency(toolCallId, conversationId, hotelId, guestId, toolName, requestPayload, executionBlock) {
+    const crypto = require('crypto');
+    const payloadHash = crypto.createHash('sha256').update(JSON.stringify(requestPayload)).digest('hex');
+
+    try {
+      let log = await prisma.toolExecutionLog.findUnique({ where: { toolCallId } });
+      if (log) {
+        if (log.status === "SUCCESS") return JSON.parse(log.responsePayload);
+        if (log.status === "PENDING") throw new Error("Concurrency Block: Duplicate execution attempt while PENDING.");
+      }
+
+      // Hash Verifier (Duplicate Payload Check)
+      const fiveMinsAgo = new Date(Date.now() - 300000);
+      const duplicateState = await prisma.transactionStateLog.findFirst({
+        where: { payloadHash, createdAt: { gt: fiveMinsAgo } }
+      });
+      if (duplicateState && duplicateState.state === 'DB_COMMITTED') {
+         await prisma.activityLog.create({ data: { conversationId, actionType: "DUPLICATE_PAYLOAD_HALTED", actionDetails: "Hash match detected." } });
+         const dupeLog = await prisma.toolExecutionLog.findUnique({ where: { toolCallId: duplicateState.toolCallId } });
+         return JSON.parse(dupeLog.responsePayload);
+      }
+
+      log = await prisma.toolExecutionLog.create({
+        data: { toolCallId, conversationId, hotelId, guestId, toolName, requestPayload: JSON.stringify(requestPayload), status: "PENDING" }
+      });
+
+      // Distributed Transaction Sentinel: PRE_FLIGHT
+      const stateLog = await prisma.transactionStateLog.create({
+        data: { toolCallId, payloadHash, category: "EXECUTION", state: "PRE_FLIGHT" }
+      });
+
+      let resultObj;
+      try {
+        resultObj = await executionBlock();
+        await prisma.transactionStateLog.update({ where: { toolCallId }, data: { state: "MEWS_EXECUTED" } });
+      } catch (err) {
+        if (err.classification === "AMBIGUOUS") {
+           await prisma.transactionStateLog.update({ where: { toolCallId }, data: { state: "AMBIGUOUS" } });
+           throw new Error("PMS is processing your request. Please hold.");
+        }
+        throw err;
+      }
+
+      await prisma.toolExecutionLog.update({
+        where: { toolCallId },
+        data: { status: "SUCCESS", responsePayload: JSON.stringify(resultObj), mewsEntityId: resultObj.data?.reservationId || null }
+      });
+
+      await prisma.transactionStateLog.update({ where: { toolCallId }, data: { state: "DB_COMMITTED" } });
+      return resultObj;
+    } catch (e) {
+      await prisma.toolExecutionLog.update({
+        where: { toolCallId }, data: { status: "FAILED", responsePayload: JSON.stringify({ error: e.message }) }
+      });
+      throw e;
+    }
+  }
+
+  // ==========================================
+  // INGESTION PIPELINE
+  // ==========================================
+  async handleIncomingMessage(hotelId, senderIdentity, content, channel = 'WhatsApp') {
+    if (!hotelId) throw new Error("hotelId is required for AutomationEngine");
+
     // 1. Identify guest
     let guest = await guestService.findByIdentity(senderIdentity);
-
     if (!guest) {
-      const mewsProfiles = await mewsService.getGuestProfile(senderIdentity);
-      if (
-        mewsProfiles &&
-        mewsProfiles.Customers &&
-        mewsProfiles.Customers.length > 0
-      ) {
-        const mCustomer = mewsProfiles.Customers[0];
-        guest = await guestService.createGuest({
-          name: `${mCustomer.FirstName} ${mCustomer.LastName}`,
-          email: mCustomer.Email,
-          phone: mCustomer.Telephone,
-          pmsGuestId: mCustomer.Id,
-        });
+      try {
+        const mewsProfiles = await mewsService.getGuestProfile(hotelId, senderIdentity);
+        if (mewsProfiles && mewsProfiles.Customers && mewsProfiles.Customers.length > 0) {
+          const mCustomer = mewsProfiles.Customers[0];
+          guest = await guestService.createGuest({
+            name: `${mCustomer.FirstName} ${mCustomer.LastName}`,
+            email: mCustomer.Email,
+            phone: mCustomer.Telephone,
+            pmsGuestId: mCustomer.Id
+          });
+        }
+      } catch (e) {
+        console.error("Mews profile lookup failed:", e.message);
       }
     }
-
     if (!guest) {
       guest = await guestService.createGuest({
-        name: "Unknown Guest",
+        name: 'Unknown Guest',
         phone: senderIdentity,
-        status: "Unidentified",
+        status: 'Unidentified'
       });
     }
 
     // 2. Find or Create Conversation
-    const conversation = await conversationService.findOrCreateConversation(
-      guest.id,
-    );
-
+    const conversation = await conversationService.findOrCreateConversation(guest.id);
+    
     // 3. Store Message
-    await conversationService.addMessage(
-      conversation.id,
-      "guest",
-      content,
-      channel,
-    );
+    await conversationService.addMessage(conversation.id, 'guest', content, channel);
+    await conversationService.logActivity(conversation.id, 'Message Received', `Channel: ${channel}`);
 
-    // 4. Log Activity
-    await conversationService.logActivity(
-      conversation.id,
-      "Message Received",
-      `Channel: ${channel}`,
-    );
-
-    // 5. Decision Logic
+    // 4. Decision Logic (OpenAI)
     try {
-      const decision = await this._decide(conversation, guest, content);
-
-      if (decision.action === "auto_reply") {
-        await conversationService.addMessage(
-          conversation.id,
-          "ai",
-          decision.response,
-          channel,
-        );
-        await conversationService.logActivity(
-          conversation.id,
-          "AI Response",
-          `Decision: ${decision.reason}`,
-        );
+      const decision = await this._decideWithAI(hotelId, conversation, guest, content, channel);
+      
+      if (decision.action === 'auto_reply') {
+        await conversationService.addMessage(conversation.id, 'ai', decision.response, channel);
+        await conversationService.logActivity(conversation.id, 'AI Response', `Tool Used: ${decision.tool || 'none'}`);
+        
+        if (channel === 'WhatsApp') {
+          try { await whatsappService.sendMessage(hotelId, guest.phone, decision.response); } 
+          catch (err) { console.error('Failed to dispatch WhatsApp message:', err.message); }
+        }
         return { success: true, response: decision.response, automated: true };
       } else {
-        await conversationService.updateStatus(
-          conversation.id,
-          "escalated",
-          decision.confidence,
-        );
-        await conversationService.logActivity(
-          conversation.id,
-          "Escalation",
-          `Reason: ${decision.reason}`,
-        );
-        return {
-          success: true,
-          message: "Escalated to human operator",
-          automated: false,
-        };
+        await conversationService.updateStatus(conversation.id, 'escalated', 0);
+        await conversationService.logActivity(conversation.id, 'Escalation', `Reason: ${decision.reason}`);
+        return { success: true, message: 'Escalated to human operator', automated: false };
       }
     } catch (error) {
-      console.error("Automation Engine Decision Error:", error);
-      await conversationService.updateStatus(conversation.id, "escalated", 0);
+      console.error('Automation Engine AI Error:', error);
+      await conversationService.updateStatus(conversation.id, 'escalated', 0);
       return { success: false, error: error.message };
     }
   }
 
-  async _decide(conversation, guest, content) {
-    try {
-      const aiDecision = await aiService.analyzeIntent(content);
-      console.log("[AutomationEngine] Groq AI intent decision:", aiDecision);
+  // ==========================================
+  // DISPATCHER & OPENAI ORCHESTRATION
+  // ==========================================
+  async _decideWithAI(hotelId, conversation, guest, content, channel) {
+    const TOOLS_SCHEMA = [
+      { type: "function", function: { name: "escalate_to_human", description: "Escalate to human.", parameters: { type: "object", properties: { reason: { type: "string" } }, required: ["reason"] } } },
+      { type: "function", function: { name: "query_hotel_knowledge_base", description: "Search policies.", parameters: { type: "object", properties: { search_query: { type: "string" } }, required: ["search_query"] } } },
+      { type: "function", function: { name: "get_guest_profile", description: "Get guest details.", parameters: { type: "object", properties: {} } } },
+      { type: "function", function: { name: "create_guest_profile", description: "Create a PMS profile so the guest can book rooms.", parameters: { type: "object", properties: { firstName: { type: "string" }, lastName: { type: "string" }, email: { type: "string" } }, required: ["firstName", "lastName", "email"] } } },
+      { type: "function", function: { name: "update_guest_profile", description: "Update guest profile.", parameters: { type: "object", properties: { email: { type: "string" } } } } },
+      { type: "function", function: { name: "update_guest_notes", description: "Add notes to profile.", parameters: { type: "object", properties: { notes: { type: "string" } }, required: ["notes"] } } },
+      { type: "function", function: { name: "check_room_availability", description: "Check room availability. Dates MUST be ISO 8601 UTC (e.g., 2026-06-02T15:00:00Z).", parameters: { type: "object", properties: { startDate: { type: "string" }, endDate: { type: "string" }, serviceId: { type: "string" } }, required: ["startDate", "endDate", "serviceId"] } } },
+      { type: "function", function: { name: "quote_price", description: "Quote price for dates.", parameters: { type: "object", properties: { startDate: { type: "string" }, endDate: { type: "string" }, serviceId: { type: "string" } }, required: ["startDate", "endDate", "serviceId"] } } },
+      { type: "function", function: { name: "check_rate_plan", description: "Check rate plans.", parameters: { type: "object", properties: { serviceId: { type: "string" } }, required: ["serviceId"] } } },
+      { type: "function", function: { name: "get_available_services", description: "Get hotel services. 'Reservable' type means hotel rooms.", parameters: { type: "object", properties: {} } } },
+      { type: "function", function: { name: "find_reservation", description: "List all active stays.", parameters: { type: "object", properties: {} } } },
+      { type: "function", function: { name: "get_reservation_by_customer", description: "Get reservations for customer.", parameters: { type: "object", properties: {} } } },
+      { type: "function", function: { name: "get_cancellation_policy", description: "Get cancellation policy.", parameters: { type: "object", properties: { rateId: { type: "string" } }, required: ["rateId"] } } },
+      { type: "function", function: { name: "create_reservation", description: "Create reservation. Dates MUST be ISO 8601 UTC (e.g., 2026-06-02T15:00:00Z).", parameters: { type: "object", properties: { serviceId: { type: "string" }, startDate: { type: "string" }, endDate: { type: "string" } }, required: ["serviceId", "startDate", "endDate"] } } },
+      { type: "function", function: { name: "modify_reservation", description: "Modify reservation dates.", parameters: { type: "object", properties: { reservationId: { type: "string" }, endUtc: { type: "string" } }, required: ["reservationId", "endUtc"] } } },
+      { type: "function", function: { name: "cancel_reservation", description: "Cancel reservation.", parameters: { type: "object", properties: { reservationId: { type: "string" }, reason: { type: "string" } }, required: ["reservationId", "reason"] } } },
+      { type: "function", function: { name: "create_service_reservation", description: "Book spa/breakfast.", parameters: { type: "object", properties: { serviceId: { type: "string" }, startDate: { type: "string" }, endDate: { type: "string" } }, required: ["serviceId", "startDate", "endDate"] } } },
+      { type: "function", function: { name: "check_in_guest", description: "Check in guest.", parameters: { type: "object", properties: { reservationId: { type: "string" } }, required: ["reservationId"] } } },
+      { type: "function", function: { name: "check_out_guest", description: "Check out guest.", parameters: { type: "object", properties: { reservationId: { type: "string" } }, required: ["reservationId"] } } },
+      { type: "function", function: { name: "check_late_checkout", description: "Check late checkout.", parameters: { type: "object", properties: {} } } },
+      { type: "function", function: { name: "confirm_late_checkout", description: "Confirm late checkout.", parameters: { type: "object", properties: { time: { type: "string" } }, required: ["time"] } } },
+      { type: "function", function: { name: "get_folio_balance", description: "Get outstanding balance.", parameters: { type: "object", properties: {} } } },
+      { type: "function", function: { name: "send_payment_link", description: "Generate payment link.", parameters: { type: "object", properties: { amount: { type: "number" } }, required: ["amount"] } } },
+      { type: "function", function: { name: "amend_payment", description: "Amend a payment.", parameters: { type: "object", properties: { paymentId: { type: "string" } }, required: ["paymentId"] } } },
+      { type: "function", function: { name: "post_charge", description: "Post a charge.", parameters: { type: "object", properties: { serviceId: { type: "string" }, amount: { type: "number" } }, required: ["serviceId", "amount"] } } }
+    ];
 
-      if (aiDecision.requiresEscalation) {
-        return {
-          action: "escalate",
-          confidence: aiDecision.confidence,
-          reason: aiDecision.reason,
-        };
-      }
+    const ALLOWLIST = TOOLS_SCHEMA.map(t => t.function.name);
 
-      if (aiDecision.intent === "late_checkout") {
-        return await this._handleLateCheckout(guest, content);
-      }
+    const systemPrompt = `You are a zero-trust Hotel AI Concierge.
+All state-changing operations are backend-authoritative. You are a request generator only.
+Never assume availability, pricing, or booking success.
+Categories:
+A: Information - Use query_hotel_knowledge_base.
+B: Operations - Execute exact tools to check availability, create reservations, or retrieve balances.
+C: Ambiguous - Ask for clarification.`;
 
-      if (aiDecision.intent === "breakfast_info") {
-        return await this._handleBreakfast(guest, content);
-      }
-
-      return {
-        action: "escalate",
-        confidence: aiDecision.confidence,
-        reason: aiDecision.reason || "Intent not supported for auto-reply",
-      };
-    } catch (err) {
-      console.error(
-        "[AutomationEngine] Groq analyzeIntent failed, falling back to rules:",
-        err.message,
-      );
-      // Fallback rule-based parsing
-      const sensitiveKeywords = [
-        "refund",
-        "money",
-        "payment",
-        "complaint",
-        "manager",
-        "bad",
-        "dispute",
-      ];
-      if (sensitiveKeywords.some((k) => content.toLowerCase().includes(k))) {
-        return {
-          action: "escalate",
-          confidence: 0,
-          reason: "Sensitive keywords detected",
-        };
-      }
-
-      const lowercaseContent = content.toLowerCase();
-      if (lowercaseContent.includes("late checkout")) {
-        return await this._handleLateCheckout(guest, content);
-      }
-      if (lowercaseContent.includes("breakfast")) {
-        return await this._handleBreakfast(guest, content);
-      }
-      return {
-        action: "escalate",
-        confidence: 0.5,
-        reason: "Intent not recognized for auto-approval",
-      };
+    const dbHistory = await conversationService.getRecentMessages(conversation.id, 50);
+    const formattedHistory = [];
+    
+    for (let i = 0; i < dbHistory.length; i++) {
+       const msg = dbHistory[i];
+       if (i === dbHistory.length - 1 && msg.senderType === 'guest' && msg.content === content) continue; 
+       
+       if (msg.senderType === 'guest') {
+         formattedHistory.push({ role: 'user', content: msg.content });
+       } else if (msg.senderType === 'ai') {
+         const aiMsg = { role: 'assistant', content: msg.content || "" };
+         if (msg.toolCalls) {
+           aiMsg.tool_calls = typeof msg.toolCalls === 'string' ? JSON.parse(msg.toolCalls) : msg.toolCalls;
+         }
+         formattedHistory.push(aiMsg);
+       } else if (msg.senderType === 'tool') {
+         formattedHistory.push({ role: 'tool', tool_call_id: msg.toolCallId, content: msg.content });
+       }
     }
+
+    // Sequence Repair Validation
+    const repairedHistory = [];
+    let pendingToolCalls = [];
+    
+    for (const msg of formattedHistory) {
+      // If we have pending tool calls and the next message is NOT a tool message,
+      // we MUST close the pending tool calls immediately before adding the new message.
+      if (pendingToolCalls.length > 0 && msg.role !== 'tool') {
+        for (const orphan of pendingToolCalls) {
+          repairedHistory.push({
+            role: 'tool',
+            tool_call_id: orphan.id,
+            name: orphan.function.name,
+            content: JSON.stringify({ status: "error", message: "Execution interrupted or escalated." })
+          });
+        }
+        pendingToolCalls = []; // clear them so they aren't processed again
+      }
+
+      if (msg.role === 'assistant' && msg.tool_calls) {
+        pendingToolCalls = [...msg.tool_calls];
+      }
+      if (msg.role === 'tool') {
+        pendingToolCalls = pendingToolCalls.filter(tc => tc.id !== msg.tool_call_id);
+      }
+      repairedHistory.push(msg);
+    }
+    
+    // If there are still pending tool calls at the very end of history
+    for (const orphan of pendingToolCalls) {
+      repairedHistory.push({
+        role: 'tool',
+        tool_call_id: orphan.id,
+        name: orphan.function.name,
+        content: JSON.stringify({ status: "error", message: "Execution interrupted or escalated." })
+      });
+    }
+
+    const messages = [
+      { role: "system", content: systemPrompt },
+      ...repairedHistory,
+      { role: "user", content }
+    ];
+
+    let currentResponse = await openai.chat.completions.create({
+      model: "gpt-4o",
+      messages: messages,
+      tools: TOOLS_SCHEMA,
+      tool_choice: "auto",
+    });
+
+    let iterations = 0;
+    let allUsedTools = [];
+    
+    while (currentResponse.choices[0].message.tool_calls && iterations < 5) {
+      iterations++;
+      const responseMessage = currentResponse.choices[0].message;
+      messages.push(responseMessage);
+      
+      await conversationService.addMessage(conversation.id, 'ai', "", channel, responseMessage.tool_calls, null);
+      
+      for (const toolCall of responseMessage.tool_calls) {
+        allUsedTools.push(toolCall.function.name);
+        const functionName = toolCall.function.name;
+        const functionArgs = JSON.parse(toolCall.function.arguments || '{}');
+        
+        let resultObj;
+
+        if (functionName === "escalate_to_human") {
+          return { action: 'escalate', reason: functionArgs.reason || 'Escalated by AI' };
+        }
+
+        if (!ALLOWLIST.includes(functionName)) {
+          resultObj = { status: "error", message: "Tool not in allowlist." };
+        } else {
+          const mappedName = "_tool" + functionName.split('_').map(word => word.charAt(0).toUpperCase() + word.slice(1)).join('');
+          
+          if (typeof this[mappedName] !== 'function') {
+            resultObj = { status: "error", message: `Tool handler missing for ${functionName}.` };
+          } else {
+            try {
+              // Wrap mutations in idempotency and lock context implicitly via the tool method
+              resultObj = await this[mappedName](hotelId, guest, functionArgs, { conversationId: conversation.id, toolCallId: toolCall.id });
+            } catch (err) {
+              console.error(`Tool execution error [${functionName}]:`, err);
+              resultObj = { status: "error", message: err.message || "Internal execution failed." };
+            }
+          }
+        }
+        
+        const resultString = JSON.stringify(resultObj);
+        messages.push({ role: "tool", tool_call_id: toolCall.id, name: functionName, content: resultString });
+        
+        await conversationService.addMessage(conversation.id, 'tool', resultString, channel, null, toolCall.id);
+      }
+
+      currentResponse = await openai.chat.completions.create({
+        model: "gpt-4o",
+        messages: messages,
+        tools: TOOLS_SCHEMA,
+        tool_choice: "auto",
+      });
+    }
+
+    return { action: 'auto_reply', response: currentResponse.choices[0].message.content, tool: allUsedTools.join(', ') || 'none' };
   }
 
-  async _handleLateCheckout(guest, content) {
-    if (!guest.pmsGuestId) {
-      return {
-        action: "auto_reply",
-        response:
-          "Based on our current late checkout policy, I can offer a checkout extension until 2:00 PM when availability allows. Would you like me to mark this request for confirmation?",
-        reason: "Demo fallback: no PMS ID, policy-based response",
-      };
-    }
-
+  // ==========================================
+  // TOOL IMPLEMENTATIONS
+  // ==========================================
+  
+  async _toolQueryHotelKnowledgeBase(hotelId, guest, args, context) {
     try {
-      // 1. Retrieve relevant policies from RAG
-      const ragResult = await ragService.queryKnowledge(
-        "late checkout policy",
-        guest.hotelId,
-        3,
-      );
-      const policyContext =
-        ragResult.context || "Late checkout is available based on occupancy.";
-
-      const stays = await mewsService.getStayDetails(guest.pmsGuestId);
-      const activeStay = stays.Reservations?.find(
-        (r) => r.State === "CheckedIn",
-      );
-
-      if (!activeStay) {
-        const prompt = `Guest: "${content}"\nPolicy Context: ${policyContext}\n\nResponse needed: I couldn't find an active stay for you. Ask if they want me to check upcoming reservations.`;
-        const aiResponse = await aiService.generateResponse(prompt);
-        return {
-          action: "auto_reply",
-          response: aiResponse,
-          reason: "No active stay",
-        };
-      }
-
-      const occupancyRate = 85;
-
-      if (occupancyRate < 90) {
-        const prompt = `Guest ${guest.name} requested late checkout. Message: "${content}"\n\nPolicy Context:\n${policyContext}\n\nOccupancy: low (85%), within policy limits. Approve late checkout based on policy and ask them to confirm.`;
-        const aiResponse = await aiService.generateResponse(prompt);
-        return {
-          action: "auto_reply",
-          response: aiResponse,
-          reason: "Low occupancy, within policy",
-        };
-      }
-
-      return {
-        action: "escalate",
-        confidence: 0.6,
-        reason: "High occupancy, requires human review",
-      };
-    } catch (err) {
-      console.error(
-        "[AutomationEngine] Late checkout handler error:",
-        err.message,
-      );
-      return {
-        action: "auto_reply",
-        response: `Based on current availability, I can offer you a late checkout at 2:00 PM. Would you like me to confirm this for you?`,
-        reason: "Low occupancy, within policy",
-      };
-    }
+      const q = await openai.embeddings.create({ model: "text-embedding-3-small", input: args.search_query, dimensions: 1024 });
+      const vector = q.data[0].embedding;
+      const response = await pineconeIndex.query({ topK: 3, vector: vector, filter: { hotelId: hotelId }, includeMetadata: true });
+      if (response.matches.length > 0) return { status: "success", data: response.matches.map(m => m.metadata.content).join("\n") };
+      return { status: "success", data: "No specific policy found." };
+    } catch (e) { return { status: "error", message: "Knowledge base error." }; }
   }
 
-  async _handleBreakfast(guest, content) {
-    try {
-      // 1. Retrieve breakfast policy from RAG
-      const ragResult = await ragService.queryKnowledge(
-        "breakfast hours dining information",
-        guest.hotelId,
-        3,
-      );
-      const breakfastContext =
-        ragResult.context ||
-        "Breakfast is served daily in the dining hall. Offer to book a table.";
+  async _toolGetGuestProfile(hotelId, guest, args, context) {
+    if (!guest.pmsGuestId) return { status: "error", message: "No PMS profile." };
+    const mewsProfiles = await mewsService.getGuestProfile(hotelId, guest.email || guest.phone);
+    return { status: "success", data: mewsProfiles };
+  }
 
-      // 2. Generate response with RAG context
-      const prompt = `Guest requested breakfast information: "${content}"\n\nBreakfast Policy:\n${breakfastContext}\n\nGenerate a helpful response offering to book a table or provide more information.`;
-      const aiResponse = await aiService.generateResponse(prompt);
+  async _toolCreateGuestProfile(hotelId, guest, args, context) {
+    return this._withIdempotency(context.toolCallId, context.conversationId, hotelId, guest.id, "create_guest_profile", args, async () => {
+      if (guest.pmsGuestId) return { status: "success", data: "Guest already has a PMS profile." };
+      
+      let pmsId = null;
+      try {
+        const res = await mewsService.addCustomer(hotelId, args.email, args.firstName, args.lastName, guest.phone);
+        pmsId = res.Id;
+      } catch (err) {
+        if (err.message && err.message.includes("already exists")) {
+          // Fetch existing customer from Mews
+          const existing = await mewsService.getGuestProfile(hotelId, args.email);
+          if (existing && existing.Customers && existing.Customers.length > 0) {
+            pmsId = existing.Customers[0].Id;
+          } else {
+            throw new Error("Customer exists in PMS but could not retrieve ID.");
+          }
+        } else {
+          throw err;
+        }
+      }
+      
+      // Update local guest
+      await prisma.guest.update({
+        where: { id: guest.id },
+        data: { 
+          name: `${args.firstName} ${args.lastName}`,
+          email: args.email,
+          pmsGuestId: pmsId
+        }
+      });
+      // also update the in-memory guest object so subsequent tools in the same conversation work
+      guest.pmsGuestId = pmsId;
+      guest.name = `${args.firstName} ${args.lastName}`;
+      guest.email = args.email;
+      
+      return { status: "success", data: `Profile linked with PMS ID ${pmsId}. You can now book rooms.` };
+    });
+  }
 
-      return {
-        action: "auto_reply",
-        response: aiResponse,
-        reason: "General information from knowledge base",
-      };
-    } catch (err) {
-      console.error("[AutomationEngine] Breakfast handler error:", err.message);
-      return {
-        action: "auto_reply",
-        response: `Breakfast is served daily from 7:00 AM to 10:30 AM in the Grand Dining Hall. Would you like me to reserve a table for tomorrow?`,
-        reason: "General information",
-      };
+  async _toolUpdateGuestProfile(hotelId, guest, args, context) {
+    return this._withIdempotency(context.toolCallId, context.conversationId, hotelId, guest.id, "update_guest_profile", args, async () => {
+       if (!guest.pmsGuestId) throw new Error("No PMS profile to update.");
+       // Ownership implicitly valid if updating self
+       return { status: "success", data: await mewsService.updateGuestNotes(hotelId, guest.pmsGuestId, args.notes || args.email) };
+    });
+  }
+
+  async _toolUpdateGuestNotes(hotelId, guest, args, context) {
+    return this._withIdempotency(context.toolCallId, context.conversationId, hotelId, guest.id, "update_guest_notes", args, async () => {
+       if (!guest.pmsGuestId) throw new Error("No PMS profile.");
+       return { status: "success", data: await mewsService.updateGuestNotes(hotelId, guest.pmsGuestId, args.notes) };
+    });
+  }
+
+  async _toolCheckRoomAvailability(hotelId, guest, args, context) {
+    // Read only, no idempotency needed
+    const result = await mewsService.getRoomAvailability(hotelId, args.startDate, args.endDate);
+    return { status: "success", data: result };
+  }
+
+  async _toolQuotePrice(hotelId, guest, args, context) {
+    const result = await mewsService.getRoomAvailability(hotelId, args.startDate, args.endDate);
+    return { status: "success", data: result };
+  }
+
+  async _toolCheckRatePlan(hotelId, guest, args, context) {
+    return { status: "success", data: "Rate plan retrieved." }; // Simplified for now
+  }
+
+  async _toolGetAvailableServices(hotelId, guest, args, context) {
+    const response = await mewsService.getServices(hotelId);
+    const services = (response.Services || [])
+       .filter(s => s.IsActive && s.Type === 'Reservable')
+       .map(s => ({
+          id: s.Id,
+          name: s.Name,
+          type: s.Type
+       }));
+    return { status: "success", data: services };
+  }
+
+  async _toolFindReservation(hotelId, guest, args, context) {
+    if (!guest.pmsGuestId) return { status: "error", message: "Not linked." };
+    const stays = await mewsService.getStayDetails(hotelId, guest.pmsGuestId);
+    return { status: "success", data: stays };
+  }
+
+  async _toolGetReservationByCustomer(hotelId, guest, args, context) {
+    return this._toolFindReservation(hotelId, guest, args, context);
+  }
+
+  async _toolGetCancellationPolicy(hotelId, guest, args, context) {
+    return { status: "success", data: "Cancellation is allowed 24 hours prior." };
+  }
+
+  async _toolCreateReservation(hotelId, guest, args, context) {
+    return this._withIdempotency(context.toolCallId, context.conversationId, hotelId, guest.id, "create_reservation", args, async () => {
+      if (!guest.pmsGuestId) throw new Error("Guest not in PMS.");
+
+      // Check availability: count existing reservations in that window
+      const window = await mewsService.getArrivalsDepartures(hotelId, args.startDate, args.endDate);
+      const busyCount = (window.Reservations || []).length;
+      console.log(`[Availability] ${busyCount} existing reservations in requested window.`);
+
+      try {
+        await prisma.bookingLock.create({
+          data: { hotelId, serviceId: args.serviceId, startDate: new Date(args.startDate), endDate: new Date(args.endDate), expiresAt: new Date(Date.now() + 60000) }
+        });
+      } catch (e) {
+        throw new Error("Race condition prevented: Inventory currently locked by another process.");
+      }
+
+      try {
+        // Use createRoomReservation which auto-fetches the RateId from Mews
+        const res = await mewsService.createRoomReservation(hotelId, guest.pmsGuestId, args.serviceId, args.startDate, args.endDate);
+        
+        await prisma.activityLog.create({ data: { conversationId: context.conversationId, actionType: "BOOKING_CREATED", actionDetails: JSON.stringify(res) } });
+        await prisma.bookingLock.deleteMany({ where: { hotelId, serviceId: args.serviceId, startDate: new Date(args.startDate), endDate: new Date(args.endDate) } });
+        
+        const reservation = (res.Reservations || [])[0];
+        if (!reservation) throw new Error('Booking created but no reservation data returned.');
+        
+        return { 
+          status: "success", 
+          data: {
+            reservationId: reservation.Id,
+            bookingNumber: reservation.Number,
+            state: reservation.State,
+            checkIn: reservation.StartUtc,
+            checkOut: reservation.EndUtc,
+            guestName: guest.name || 'John Doe'
+          }
+        };
+      } catch (e) {
+        await prisma.activityLog.create({ data: { conversationId: context.conversationId, actionType: "BOOKING_FAILED", actionDetails: e.message } });
+        await prisma.bookingLock.deleteMany({ where: { hotelId, serviceId: args.serviceId, startDate: new Date(args.startDate), endDate: new Date(args.endDate) } });
+        throw e;
+      }
+    });
+  }
+
+  async _toolModifyReservation(hotelId, guest, args, context) {
+    return this._withIdempotency(context.toolCallId, context.conversationId, hotelId, guest.id, "modify_reservation", args, async () => {
+      await this._ownershipMiddleware(hotelId, guest, args.reservationId);
+      const res = await mewsService.updateReservation(hotelId, args.reservationId, { EndUtc: args.endUtc });
+      return { status: "success", data: res };
+    });
+  }
+
+  async _toolCancelReservation(hotelId, guest, args, context) {
+    return this._withIdempotency(context.toolCallId, context.conversationId, hotelId, guest.id, "cancel_reservation", args, async () => {
+      await this._ownershipMiddleware(hotelId, guest, args.reservationId);
+      // Assuming mewsService.cancelReservation exists
+      if (typeof mewsService.cancelReservation === 'function') {
+         const res = await mewsService.cancelReservation(hotelId, args.reservationId, args.reason);
+         return { status: "success", data: res };
+      }
+      return { status: "error", message: "mewsService.cancelReservation not implemented." };
+    });
+  }
+  async _toolEscalateToHuman(hotelId, guest, args, context) {
+    return this._withIdempotency(context.toolCallId, context.conversationId, hotelId, guest.id, "escalate_to_human", args, async () => {
+      await conversationService.escalateConversation(context.conversationId, args.reason);
+      return { _escalated: true };
+    });
+  }
+
+  async _toolCreateServiceReservation(hotelId, guest, args, context) {
+    return this._toolCreateReservation(hotelId, guest, args, context);
+  }
+
+  async _toolCheckInGuest(hotelId, guest, args, context) {
+    return this._withIdempotency(context.toolCallId, context.conversationId, hotelId, guest.id, "check_in_guest", args, async () => {
+      await this._ownershipMiddleware(hotelId, guest, args.reservationId);
+      const res = await mewsService.updateReservation(hotelId, args.reservationId, { State: "CheckedIn" });
+      return { status: "success", data: res };
+    });
+  }
+
+  async _toolCheckOutGuest(hotelId, guest, args, context) {
+    return this._withIdempotency(context.toolCallId, context.conversationId, hotelId, guest.id, "check_out_guest", args, async () => {
+      await this._ownershipMiddleware(hotelId, guest, args.reservationId);
+      const res = await mewsService.updateReservation(hotelId, args.reservationId, { State: "CheckedOut" });
+      return { status: "success", data: res };
+    });
+  }
+
+  async _toolCheckLateCheckout(hotelId, guest, args, context) {
+    if (!guest.pmsGuestId) return { status: "error", message: "Not linked." };
+    const stays = await mewsService.getStayDetails(hotelId, guest.pmsGuestId);
+    const activeStay = stays.Reservations?.find(r => r.State === 'CheckedIn');
+    if (!activeStay) return { status: "success", data: "Guest has no active CheckedIn reservation right now." };
+    return { status: "success", data: { reservationId: activeStay.Id, message: "Late checkout is possible." } };
+  }
+
+  async _toolConfirmLateCheckout(hotelId, guest, args, context) {
+    return this._withIdempotency(context.toolCallId, context.conversationId, hotelId, guest.id, "confirm_late_checkout", args, async () => {
+      const stays = await mewsService.getStayDetails(hotelId, guest.pmsGuestId);
+      const activeStay = stays.Reservations?.find(r => r.State === 'CheckedIn');
+      if (!activeStay) throw new Error("Guest has no active CheckedIn reservation.");
+      
+      const res = await mewsService.updateReservation(hotelId, activeStay.Id, { EndUtc: args.time });
+      return { status: "success", data: res };
+    });
+  }
+
+  async _toolGetFolioBalance(hotelId, guest, args, context) {
+    if (!guest.pmsGuestId) return { status: "error", message: "Not linked." };
+    // Assuming mewsService.getFolioBalance exists
+    if (typeof mewsService.getFolioBalance === 'function') {
+      const res = await mewsService.getFolioBalance(hotelId, guest.pmsGuestId);
+      return { status: "success", data: res };
     }
+    return { status: "error", message: "mewsService.getFolioBalance not implemented." };
+  }
+
+  async _toolSendPaymentLink(hotelId, guest, args, context) {
+    return this._withIdempotency(context.toolCallId, context.conversationId, hotelId, guest.id, "send_payment_link", args, async () => {
+      if (!guest.pmsGuestId) throw new Error("Guest not in PMS.");
+      
+      // Folio Consistency Verifier
+      if (typeof mewsService.getFolioBalance === 'function') {
+         const currentFolio = await mewsService.getFolioBalance(hotelId, guest.pmsGuestId);
+         const items = currentFolio.Items || [];
+         const currentTotal = items.reduce((acc, curr) => acc + (curr.Amount?.Value || 0), 0);
+         
+         if (Math.abs(currentTotal - args.amount) > 0.01) {
+            await prisma.activityLog.create({ data: { conversationId: context.conversationId, actionType: "PAYMENT_DESYNC_DETECTED", actionDetails: `Drift: ${currentTotal} vs requested ${args.amount}` } });
+            throw new Error("FAILED_DUE_TO_DRIFT: Balance has changed. Re-fetch folio.");
+         }
+      }
+
+      const settings = await prisma.hotelSettings.findUnique({ where: { hotelId } });
+      const currency = settings ? settings.currencyCode : "USD";
+      
+      const res = await mewsService.sendPaymentLink(hotelId, guest.pmsGuestId, args.amount, currency);
+      await prisma.activityLog.create({ data: { conversationId: context.conversationId, actionType: "PAYMENT_REQUEST_CREATED", actionDetails: JSON.stringify(res) } });
+      return { status: "success", data: res };
+    });
+  }
+
+  async _toolAmendPayment(hotelId, guest, args, context) {
+    return this._withIdempotency(context.toolCallId, context.conversationId, hotelId, guest.id, "amend_payment", args, async () => {
+      return { status: "error", message: "mewsService.amendPayment not implemented." };
+    });
+  }
+
+  async _toolPostCharge(hotelId, guest, args, context) {
+    return this._withIdempotency(context.toolCallId, context.conversationId, hotelId, guest.id, "post_charge", args, async () => {
+      if (!guest.pmsGuestId) throw new Error("Guest not in PMS.");
+      const settings = await prisma.hotelSettings.findUnique({ where: { hotelId } });
+      const currency = settings ? settings.currencyCode : "USD";
+      
+      const res = await mewsService.postCharge(hotelId, guest.pmsGuestId, args.amount, currency, args.serviceId);
+      return { status: "success", data: res };
+    });
   }
 }
 

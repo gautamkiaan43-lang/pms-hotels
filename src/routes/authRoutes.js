@@ -28,9 +28,6 @@ router.get('/users', requireAuth, authController.getUsers);
 // PATCH /api/auth/users/:id/role
 router.patch('/users/:id/role', requireAuth, authController.updateUserRole);
 
-// PUT /api/auth/users/:id
-router.put('/users/:id', requireAuth, authController.updateUser);
-
 // DELETE /api/auth/users/:id
 router.delete('/users/:id', requireAuth, authController.deleteUser);
 

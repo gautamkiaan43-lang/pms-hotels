@@ -7,19 +7,13 @@ const { sendSuccess } = require('../utils/responseHandler');
  */
 const testConnection = asyncHandler(async (req, res) => {
   try {
-    const { clientToken, accessToken, baseUrl } = req.query;
-    let result;
-    if (clientToken || accessToken) {
-      result = await mewsService.testDynamicConnection(clientToken, accessToken, baseUrl);
-    } else {
-      result = await mewsService.testConnection();
-    }
+    const result = await mewsService.testConnection();
     return sendSuccess(res, 200, { 
       status: 'Connected', 
-      hotelName: result && result.Enterprise ? result.Enterprise.Name : 'Grand Palace Hotel'
+      hotelName: result.Enterprise.Name 
     });
   } catch (error) {
-    return res.status(200).json({ 
+    return res.status(500).json({ 
       success: false, 
       message: 'Mews Connection Failed', 
       details: error.message 

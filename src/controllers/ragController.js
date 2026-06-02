@@ -1,13 +1,54 @@
-const { PrismaClient } = require("@prisma/client");
+const { PrismaClient } = require('@prisma/client');
 const prisma = new PrismaClient();
-const ragService = require("../services/ragService");
-const qdrantService = require("../services/qdrantService");
+const path = require('path');
+const fs = require('fs');
+const { OpenAI } = require('openai');
+const pdfParse = require('pdf-parse');
+const { Pinecone } = require('@pinecone-database/pinecone');
+
+const openai = new OpenAI({
+  apiKey: process.env.OPENAI_API_KEY,
+});
+
+// Initialize Pinecone
+const pc = new Pinecone({
+  apiKey: process.env.PINECONE_API_KEY,
+});
+// Using the index name based on the URL provided (hotel-pms)
+const pineconeIndex = pc.Index('hotel-pms', process.env.PINECONE_URL);
+
+// Simple text chunker
+function chunkText(text, maxChars = 1000) {
+  const chunks = [];
+  let currentChunk = '';
+  const sentences = text.split(/(?<=[.?!])\s+/);
+  
+  for (const sentence of sentences) {
+    if ((currentChunk + sentence).length > maxChars) {
+      if (currentChunk.trim()) chunks.push(currentChunk.trim());
+      currentChunk = sentence + ' ';
+    } else {
+      currentChunk += sentence + ' ';
+    }
+  }
+  if (currentChunk.trim()) chunks.push(currentChunk.trim());
+  return chunks;
+}
 
 // Fetch all uploaded knowledge documents
 exports.getDocuments = async (req, res) => {
-  console.log(`[RAGController] Fetching documents for hotelId=${req.query.hotelId || req.headers["x-hotel-id"] || req.user?.hotelId}`);
   try {
-    const docs = await prisma.knowledgeDocument.findMany();
+    let hotelId = req.user?.hotelId;
+    if (!hotelId) {
+      const hotel = await prisma.hotel.findFirst();
+      if (!hotel) return res.status(404).json({ message: 'No hotel found' });
+      hotelId = hotel.id;
+    }
+    hotelId = parseInt(hotelId, 10);
+
+    const docs = await prisma.knowledgeDocument.findMany({
+      where: { hotelId }
+    });
     res.json(docs);
   } catch (error) {
     console.error('Get Documents Error:', error);
@@ -15,224 +56,151 @@ exports.getDocuments = async (req, res) => {
   }
 };
 
-// New endpoint to trigger reindex (dummy for logging)
-exports.reindexDocument = async (req, res) => {
-  const { id } = req.params;
-  console.log(`[RAGController] Reindex request received for document ID ${id}`);
-  try {
-    // Fetch the document record
-    const doc = await prisma.knowledgeDocument.findUnique({ where: { id: parseInt(id) } });
-    if (!doc) {
-      return res.status(404).json({ message: `Document ${id} not found` });
-    }
-    await prisma.knowledgeDocument.update({
-      where: { id: doc.id },
-      data: { isVectorized: true },
-    });
-    res.json({ message: `Reindex completed for document ${id}` });
-  } catch (error) {
-    console.error('[RAGController] Reindex error:', error);
-    res.status(500).json({ message: 'Failed to reindex document', error: error.message });
-  }
-};
-
-// Query the RAG knowledge base
-exports.queryKnowledge = async (req, res) => {
-  try {
-    const { query, topK = 5 } = req.body;
-    const hotelId = parseInt(
-      req.query.hotelId || req.headers["x-hotel-id"] || req.user?.hotelId || 5,
-    );
-
-    if (!query || query.trim().length === 0) {
-      return res.status(400).json({ message: "Query is required" });
-    }
-
-    // Query knowledge base
-    const result = await ragService.queryKnowledge(query, hotelId, topK);
-
-    res.json({
-      query: result.query,
-      results: result.results,
-      context: result.context,
-      resultCount: result.results.length,
-    });
-  } catch (error) {
-    console.error("RAG Query Error:", error);
-    res
-      .status(500)
-      .json({
-        message: "Failed to query knowledge base",
-        error: error.message,
-      });
-  }
-};
-
-// Delete a knowledge document
-exports.deleteDocument = async (req, res) => {
-  try {
-    const { id } = req.params;
-
-    // Delete from Qdrant (delete all chunks with this document ID)
-    // Note: This is a simplified approach - in production you'd track all point IDs
-    const doc = await prisma.knowledgeDocument.findUnique({
-      where: { id: parseInt(id) },
-    });
-
-    // Delete from database
-    await prisma.knowledgeDocument.delete({
-      where: { id: parseInt(id) },
-    });
-
-    res.json({
-      success: true,
-      message: "Document removed successfully from vector RAG pipeline",
-    });
-  } catch (error) {
-    console.error("Delete Document Error:", error);
-    res.status(500).json({ message: "Failed to delete knowledge document" });
-  }
-};
-
 // Handle document upload and trigger vectorization
 exports.uploadDocument = async (req, res) => {
   try {
-    const hotelId = parseInt(
-      req.body.hotelId ||
-        req.query.hotelId ||
-        req.user?.hotelId ||
-        req.headers["x-hotel-id"]
-    );
-    // Resolve a valid hotel ID; if the provided ID does not exist, fall back to the first hotel record.
-    let resolvedHotelId = hotelId;
-    let hotelRecord = null;
-    
-    if (!isNaN(resolvedHotelId)) {
-      hotelRecord = await prisma.hotel.findUnique({ where: { id: resolvedHotelId } });
+    let hotelId = req.user?.hotelId;
+    if (!hotelId) {
+      const hotel = await prisma.hotel.findFirst();
+      if (!hotel) return res.status(404).json({ message: 'No hotel found' });
+      hotelId = hotel.id;
     }
-    if (!hotelRecord) {
-      const firstHotel = await prisma.hotel.findFirst();
-      if (firstHotel) {
-        resolvedHotelId = firstHotel.id;
-      } else {
-        return res
-          .status(400)
-          .json({ message: "No hotel records exist in the system. Create a hotel before uploading documents." });
-      }
-    }
-    // Multer provides the file in req.file
-    const file = req.file;
-    if (!file) {
-      return res.status(400).json({ message: "File is required" });
-    }
-    
-    const filename = req.body.filename || file.originalname;
-    const docType = req.body.docType || 'SOP';
+    hotelId = parseInt(hotelId, 10);
 
-    let content = "";
-    if (file.mimetype === 'application/pdf' || filename.toLowerCase().endsWith('.pdf')) {
-      const { PDFParse } = require('pdf-parse');
-      let parser;
-      try {
-        parser = new PDFParse({ data: file.buffer });
-        const pdfData = await parser.getText();
-        content = pdfData.text;
-      } catch (pdfErr) {
-        console.error("PDF Parsing error:", pdfErr);
-        return res.status(400).json({ message: "Failed to parse PDF document." });
-      } finally {
-        if (parser) {
-          await parser.destroy().catch(() => {});
-        }
-      }
-    } else {
-      content = file.buffer.toString('utf-8');
+    const { filename, docType } = req.body; 
+    
+    // In a production app, use multer to handle req.file
+    let textToEmbed = 'This is a placeholder policy document. Gold members get late checkout until 2 PM. Regular checkout is 11 AM.';
+    
+    if (req.file && req.file.path) {
+      const dataBuffer = fs.readFileSync(req.file.path);
+      const pdfData = await pdfParse(dataBuffer);
+      textToEmbed = pdfData.text;
     }
 
-    // Create DB record for the file
+    // 1. Create DB record for the file in Prisma (MySQL)
     const newDoc = await prisma.knowledgeDocument.create({
       data: {
-        hotelId: resolvedHotelId,
-        filename: filename || "Unknown_Document.pdf",
-        fileUrl: `/uploads/${Date.now()}_${filename}`,
-        docType: docType,
-        isVectorized: false,
-      },
+        hotelId,
+        filename: filename || (req.file ? req.file.originalname : 'Unknown_Document.pdf'),
+        fileUrl: req.file ? `/uploads/${req.file.filename}` : `/uploads/${Date.now()}_doc.pdf`,
+        docType: docType || 'SOP',
+        isVectorized: false
+      }
     });
 
-    // Process document asynchronously
-    setImmediate(async () => {
+    // 2. Perform Vectorization
+    (async () => {
       try {
-        const result = await ragService.processDocument(content, {
-          filename,
-          docType,
-          hotelId: resolvedHotelId,
-          documentId: newDoc.id,
+        console.log(`[RAG Engine] Processing ${newDoc.filename}... chunking text...`);
+        const chunks = chunkText(textToEmbed);
+        
+        console.log(`[RAG Engine] Generating ${chunks.length} embeddings...`);
+        const embeddingsResponse = await openai.embeddings.create({
+          model: "text-embedding-3-small",
+          input: chunks,
+          dimensions: 1024
         });
 
-        // Update DB record
+        console.log(`[RAG Engine] Saving vectors to Pinecone...`);
+        const pineconeRecords = chunks.map((chunk, i) => ({
+          id: `doc_${newDoc.id}_chunk_${i}`,
+          values: embeddingsResponse.data[i].embedding,
+          metadata: {
+            documentId: newDoc.id,
+            hotelId: hotelId,
+            content: chunk
+          }
+        }));
+
+        // Upsert to Pinecone
+        console.log(`[RAG Engine] pineconeRecords:`, JSON.stringify(pineconeRecords));
+        if (!pineconeRecords || pineconeRecords.length === 0) {
+          throw new Error('No pinecone records generated to upsert.');
+        }
+        await pineconeIndex.upsert({ records: pineconeRecords });
+
         await prisma.knowledgeDocument.update({
           where: { id: newDoc.id },
           data: {
             isVectorized: true,
-            vectorCount: result.count,
-          },
+            vectorCount: chunks.length
+          }
         });
-
-        console.log(
-          `[RAG Controller] Document ${filename} successfully vectorized: ${result.count} chunks`,
-        );
+        console.log(`[RAG Engine] ${newDoc.filename} vectorized successfully.`);
       } catch (err) {
-        console.error(
-          `[RAG Controller] Failed to process document ${filename}:`,
-          err.message,
-        );
-        // Mark as failed but don't throw
-        await prisma.knowledgeDocument
-          .update({
-            where: { id: newDoc.id },
-            data: { isVectorized: false },
-          })
-          .catch(() => {});
+        console.error(`[RAG Engine] Error vectorizing document ${newDoc.id}:`, err);
       }
-    });
+    })();
 
-    res.status(201).json({
-      message: "Document uploaded and sent to RAG pipeline for processing",
-      document: newDoc,
+    res.status(201).json({ 
+      message: 'Document uploaded and is being processed by the RAG engine', 
+      document: newDoc 
     });
   } catch (error) {
-    console.error("Upload Document Error:", error);
-    res.status(500).json({ message: "Failed to upload document" });
+    console.error('Upload Document Error:', error);
+    res.status(500).json({ message: 'Failed to upload document' });
   }
 };
 
-// GET query-test endpoint for browser-based RAG testing
-exports.queryKnowledgeTest = async (req, res) => {
+// Query the RAG knowledge base via Pinecone
+exports.queryKnowledge = async (req, res) => {
   try {
-    const { query, topK = 3 } = req.query;
-    const hotelId = parseInt(
-      req.query.hotelId || req.headers["x-hotel-id"] || req.user?.hotelId || 13
-    );
-
-    if (!query || query.trim().length === 0) {
-      return res.status(400).json({ message: "Query parameter is required" });
+    const { query } = req.body;
+    
+    if (!query) {
+      return res.status(400).json({ message: 'Query is required' });
     }
 
-    const result = await ragService.queryKnowledge(query, hotelId, parseInt(topK));
+    // 1. Embed the query string
+    const queryEmbeddingResponse = await openai.embeddings.create({
+      model: "text-embedding-3-small",
+      input: query,
+      dimensions: 1024
+    });
+    
+    const queryVector = queryEmbeddingResponse.data[0].embedding;
+
+    // 2. Perform similarity search in Pinecone
+    const queryResponse = await pineconeIndex.query({
+      topK: 3,
+      vector: queryVector,
+      includeMetadata: true,
+      includeValues: false
+    });
+
+    const results = queryResponse.matches.map(match => ({
+      source: `Document ID: ${match.metadata?.documentId || 'Unknown'}`,
+      content: match.metadata?.content || '',
+      confidence: match.score?.toFixed(2) || 0
+    }));
 
     res.json({
-      success: true,
-      query: result.query,
-      results: result.results,
-      context: result.context,
-      resultCount: result.results.length,
+      query,
+      results: results.length > 0 ? results : [{
+        source: 'System',
+        content: 'No relevant information found in the knowledge base.',
+        confidence: 0
+      }]
     });
   } catch (error) {
-    console.error("RAG Query Test Error:", error);
-    res.status(500).json({
-      message: "Failed to query knowledge base",
-      error: error.message,
+    console.error('RAG Query Error:', error);
+    res.status(500).json({ message: 'Failed to query knowledge base' });
+  }
+};
+
+// Delete a document
+exports.deleteDocument = async (req, res) => {
+  try {
+    const { id } = req.params;
+    
+    await prisma.knowledgeDocument.delete({
+      where: { id: parseInt(id) }
     });
+
+    res.json({ message: 'Document deleted successfully' });
+  } catch (error) {
+    console.error('Delete Document Error:', error);
+    res.status(500).json({ message: 'Failed to delete document' });
   }
 };

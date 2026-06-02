@@ -1,112 +1,89 @@
-const { PrismaClient } = require('@prisma/client');
-const prisma = new PrismaClient();
-const asyncHandler = require('../middleware/asyncHandler');
-
-/**
- * GET /api/activity-logs
- * Returns real activity logs from the DB, joined with Conversation + Guest data.
- * Supports optional query params: filter (All|Resolved|Escalated), search, limit
- */
-const getActivityLogs = asyncHandler(async (req, res) => {
-  const { filter, search, limit = 100 } = req.query;
-
-  // Fetch activity logs joined with conversation and guest
-  const logs = await prisma.activityLog.findMany({
-    take: parseInt(limit),
-    orderBy: { createdAt: 'desc' },
-    include: {
-      conversation: {
-        include: {
-          guest: true,
-          messages: {
-            orderBy: { createdAt: 'asc' },
-            take: 10,
-          },
-        },
-      },
-    },
-  });
-
-  // Transform DB records into the shape the frontend expects
-  const formatted = logs.map((log) => {
-    const conversation = log.conversation;
-    const guest = conversation?.guest;
-
-    // Parse actionDetails – stored as JSON string or plain text
-    let details = {};
-    try {
-      details = JSON.parse(log.actionDetails);
-    } catch {
-      details = {
-        guestRequest: log.actionDetails || '',
-        aiReply: '',
-        pmsUpdate: '',
-        escalationReason: '',
-      };
+const mockLogs = [
+  { 
+    id: 1, 
+    timestamp: '10:42 AM', 
+    guest: 'Sarah Jenkins',
+    room: 'Room 502',
+    channel: 'WhatsApp', 
+    requestType: 'Late Checkout', 
+    aiAction: 'AI approved late checkout',
+    pmsStatus: 'Late checkout synced to PMS', 
+    confidence: '98%',
+    finalStatus: 'Resolved',
+    type: 'success',
+    details: {
+      guestRequest: "Can I have a late checkout tomorrow at 4 PM?",
+      aiReply: "Hello Sarah! As a Gold member, I've extended your checkout until 2:00 PM complimentary. Your digital room key has been updated automatically.",
+      pmsUpdate: "Late checkout extension posted successfully to folio.",
+      escalationReason: ""
     }
-
-    // Derive channel from the first message in the conversation
-    const firstMsg = conversation?.messages?.[0];
-    const channel = firstMsg?.channel || 'WhatsApp';
-
-    // Derive confidence from conversation score (stored as 0-1 float → convert to %)
-    const confidenceRaw = conversation?.confidenceScore ?? 1;
-    const confidencePct = Math.round(confidenceRaw * 100);
-
-    // Derive final status
-    const isFailed = log.actionType?.toLowerCase().includes('escalat');
-    const finalStatus = isFailed ? 'Escalated' : 'Resolved';
-
-    // Timestamp – formatted as HH:MM AM/PM
-    const timestamp = new Date(log.createdAt).toLocaleTimeString('en-US', {
-      hour: '2-digit',
-      minute: '2-digit',
-    });
-
-    return {
-      id: log.id,
-      timestamp,
-      createdAt: log.createdAt,
-      guest: guest?.name || 'Unknown Guest',
-      room: guest?.roomNumber ? `Room ${guest.roomNumber}` : 'N/A',
-      channel,
-      requestType: details.requestType || log.actionType || 'Guest Request',
-      aiAction: details.aiAction || log.actionType || 'AI processed request',
-      pmsStatus: details.pmsUpdate || 'PMS updated',
-      confidence: `${confidencePct}%`,
-      finalStatus,
-      type: finalStatus === 'Escalated' ? 'warning' : 'success',
-      details: {
-        guestRequest: details.guestRequest || '',
-        aiReply: details.aiReply || '',
-        pmsUpdate: details.pmsUpdate || '',
-        escalationReason: details.escalationReason || '',
-      },
-    };
-  });
-
-  // Apply filter
-  let filtered = formatted;
-  if (filter && filter !== 'All Logs') {
-    filtered = formatted.filter((l) => l.finalStatus === filter);
+  },
+  { 
+    id: 2, 
+    timestamp: '10:38 AM', 
+    guest: 'Michael Chen',
+    room: 'Room 112',
+    channel: 'Email', 
+    requestType: 'Spa Booking', 
+    aiAction: 'AI escalated refund request',
+    pmsStatus: 'Awaiting PMS confirmation', 
+    confidence: '62%',
+    finalStatus: 'Escalated',
+    type: 'warning',
+    details: {
+      guestRequest: "I want a deep tissue massage but can you apply a special VIP discount?",
+      aiReply: "I am routing your request to David at Guest Relations to apply your special VIP discount.",
+      pmsUpdate: "Awaiting staff custom discount approval override.",
+      escalationReason: "Low confidence: Surcharge waiver fell below standard safety threshold."
+    }
+  },
+  { 
+    id: 3, 
+    timestamp: '10:35 AM', 
+    guest: 'Emma Watson',
+    room: 'Room 215',
+    channel: 'WhatsApp', 
+    requestType: 'WiFi Inquiry', 
+    aiAction: 'AI provided WiFi instructions',
+    pmsStatus: 'PMS updated successfully', 
+    confidence: '95%',
+    finalStatus: 'Resolved',
+    type: 'success',
+    details: {
+      guestRequest: "What's the WiFi password here?",
+      aiReply: "Hello Emma! You can connect to 'GrandResort_Guest' and log in with your room number 215 and your last name.",
+      pmsUpdate: "Query resolved. No folio surcharge required.",
+      escalationReason: ""
+    }
+  },
+  { 
+    id: 4, 
+    timestamp: '09:12 AM', 
+    guest: 'James Bond',
+    room: 'Room 304',
+    channel: 'WhatsApp', 
+    requestType: 'Minibar Charge', 
+    aiAction: 'AI posted minibar charge',
+    pmsStatus: 'Service charge recorded', 
+    confidence: '100%',
+    finalStatus: 'Resolved',
+    type: 'success',
+    details: {
+      guestRequest: "I took a water bottle and a chocolate from the minibar. Please charge Room 304.",
+      aiReply: "Understood, James. I've added a charge of $12.00 for the water and chocolate to your room bill.",
+      pmsUpdate: "Minibar refill surcharge posted successfully to guest bill.",
+      escalationReason: ""
+    }
   }
+];
 
-  // Apply search (guest name or room)
-  if (search) {
-    const q = search.toLowerCase();
-    filtered = filtered.filter(
-      (l) =>
-        l.guest.toLowerCase().includes(q) ||
-        l.room.toLowerCase().includes(q) ||
-        l.requestType.toLowerCase().includes(q)
-    );
-  }
-
-  return res.status(200).json({
+const getActivityLogs = (req, res) => {
+  res.status(200).json({
     success: true,
-    total: filtered.length,
-    data: filtered,
+    data: mockLogs
   });
-});
+};
 
-module.exports = { getActivityLogs };
+module.exports = {
+  getActivityLogs
+};

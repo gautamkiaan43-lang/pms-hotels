@@ -48,13 +48,11 @@ const createGuest = async (data) => {
     data: {
       name: data.name,
       email: data.email,
-      phone: data.phone,
-      location: data.location || null,
+      phone: data.phone || 'No Phone',
       status: data.status || 'Regular',
       spent: parseFloat(data.spent) || 0,
       visits: parseInt(data.visits) || 1,
-      roomNumber: data.roomNumber || null,
-      pmsGuestId: data.pmsGuestId || null
+      roomNumber: data.roomNumber || null
     }
   });
 };

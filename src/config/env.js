@@ -10,10 +10,6 @@ const config = {
   env: process.env.NODE_ENV || 'development',
   jwtSecret: process.env.JWT_SECRET || 'fallback_secret_key',
   jwtExpiresIn: process.env.JWT_EXPIRES_IN || '7d',
-  pinecone: {
-    url: process.env.PINECONE_URL,
-    apiKey: process.env.PINECONE_API_KEY
-  },
   mews: {
     baseUrl: process.env.MEWS_BASE_URL,
     clientToken: process.env.MEWS_CLIENT_TOKEN,

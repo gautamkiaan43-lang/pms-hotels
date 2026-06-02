@@ -9,27 +9,9 @@ async function main() {
     { name: 'Apaleo Executive Suites', pmsConnected: 'Apaleo', whatsappActive: false, knowledgeBaseActive: true, chatsToday: 23, aiProcessed: 142, satisfaction: 94.8, escalations: 0, plan: 'Trial', status: 'Active', monthlyUsage: 18 }
   ];
 
-  console.log('Clearing old hotels...');
-  await prisma.hotel.deleteMany({});
-
-  console.log('Seeding hotels...');
   for (const hotel of hotelsData) {
     await prisma.hotel.create({
-      data: {
-        hotelName: hotel.name,
-        pmsProvider: typeof hotel.pmsConnected === 'string' ? hotel.pmsConnected : 'Opera PMS',
-        pmsConnected: hotel.pmsConnected !== false,
-        whatsappConnected: hotel.whatsappActive === true,
-        knowledgeBaseStatus: hotel.knowledgeBaseActive ? 'Active' : 'Pending',
-        chatsToday: hotel.chatsToday,
-        aiProcessed: hotel.aiProcessed,
-        satisfaction: hotel.satisfaction,
-        escalations: hotel.escalations,
-        subscriptionPlan: hotel.plan || 'Standard',
-        aiStatus: hotel.status || 'Active',
-        monthlyUsage: hotel.monthlyUsage,
-        hotelCode: hotel.name.toLowerCase().replace(/[^a-z0-9]/g, '_')
-      }
+      data: hotel
     });
   }
   console.log('Seed completed!');

@@ -1,6 +1,16 @@
 const prisma = require('../config/prisma');
 const asyncHandler = require('../middleware/asyncHandler');
 const { sendSuccess } = require('../utils/responseHandler');
+const { encrypt } = require('../utils/cryptoUtils');
+
+const encryptSecrets = (data) => {
+  if (data.pmsApiKey) data.pmsApiKey = encrypt(data.pmsApiKey);
+  if (data.pmsSecret) data.pmsSecret = encrypt(data.pmsSecret);
+  if (data.whatsappApiKey) data.whatsappApiKey = encrypt(data.whatsappApiKey);
+  if (data.whatsappAppSecret) data.whatsappAppSecret = encrypt(data.whatsappAppSecret);
+  if (data.smtpPass) data.smtpPass = encrypt(data.smtpPass);
+  return data;
+};
 
 const getHotels = asyncHandler(async (req, res) => {
   const hotels = await prisma.hotel.findMany({
@@ -30,7 +40,7 @@ const createHotel = asyncHandler(async (req, res) => {
 
 const updateHotel = asyncHandler(async (req, res) => {
   const { id } = req.params;
-  const updates = req.body;
+  const updates = encryptSecrets(req.body);
   
   const hotel = await prisma.hotel.update({
     where: { id: parseInt(id) },
@@ -63,7 +73,7 @@ const updateHotelSettings = asyncHandler(async (req, res) => {
     return res.status(404).json({ success: false, message: 'Hotel not found' });
   }
   
-  const updates = req.body;
+  const updates = encryptSecrets(req.body);
   const updatedHotel = await prisma.hotel.update({
     where: { id: hotel.id },
     data: updates

@@ -5,11 +5,9 @@ const whatsappService = require('./whatsappService');
 const { PrismaClient } = require('@prisma/client');
 const prisma = new PrismaClient();
 const { OpenAI } = require('openai');
-const { Pinecone } = require('@pinecone-database/pinecone');
+const vectorDb = require('../utils/vectorDb');
 
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
-const pc = new Pinecone({ apiKey: process.env.PINECONE_API_KEY });
-const pineconeIndex = pc.Index('hotel-pms', process.env.PINECONE_URL);
 
 class AutomationEngine {
   
@@ -149,6 +147,11 @@ class AutomationEngine {
       const decision = await this._decideWithAI(hotelId, conversation, guest, content, channel);
       
       if (decision.action === 'auto_reply') {
+        // Guard: skip saving/sending if AI produced empty response
+        if (!decision.response || !decision.response.trim()) {
+          console.warn(`[AutomationEngine] AI returned empty response for Hotel ${hotelId}. Skipping message dispatch.`);
+          return { success: false, error: 'AI returned empty response' };
+        }
         await conversationService.addMessage(conversation.id, 'ai', decision.response, channel);
         await conversationService.logActivity(conversation.id, 'AI Response', `Tool Used: ${decision.tool || 'none'}`);
         
@@ -335,7 +338,12 @@ C: Ambiguous - Ask for clarification.`;
       });
     }
 
-    return { action: 'auto_reply', response: currentResponse.choices[0].message.content, tool: allUsedTools.join(', ') || 'none' };
+    const finalContent = currentResponse.choices[0].message.content;
+    if (!finalContent || !finalContent.trim()) {
+      // AI ended on a tool call with no final text — treat as escalation to avoid empty messages
+      return { action: 'escalate', reason: 'AI did not produce a final text response after tool execution.' };
+    }
+    return { action: 'auto_reply', response: finalContent, tool: allUsedTools.join(', ') || 'none' };
   }
 
   // ==========================================
@@ -346,10 +354,13 @@ C: Ambiguous - Ask for clarification.`;
     try {
       const q = await openai.embeddings.create({ model: "text-embedding-3-small", input: args.search_query, dimensions: 1024 });
       const vector = q.data[0].embedding;
-      const response = await pineconeIndex.query({ topK: 3, vector: vector, filter: { hotelId: hotelId }, includeMetadata: true });
-      if (response.matches.length > 0) return { status: "success", data: response.matches.map(m => m.metadata.content).join("\n") };
+      const matches = await vectorDb.querySimilarEmbeddings(vector, hotelId, 3);
+      if (matches.length > 0) return { status: "success", data: matches.map(m => m.metadata.content).join("\n") };
       return { status: "success", data: "No specific policy found." };
-    } catch (e) { return { status: "error", message: "Knowledge base error." }; }
+    } catch (e) { 
+      console.error('[Automation Engine] RAG query failed:', e);
+      return { status: "error", message: "Knowledge base error." }; 
+    }
   }
 
   async _toolGetGuestProfile(hotelId, guest, args, context) {

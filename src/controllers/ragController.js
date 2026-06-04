@@ -4,18 +4,11 @@ const path = require('path');
 const fs = require('fs');
 const { OpenAI } = require('openai');
 const pdfParse = require('pdf-parse');
-const { Pinecone } = require('@pinecone-database/pinecone');
+const vectorDb = require('../utils/vectorDb');
 
 const openai = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY,
 });
-
-// Initialize Pinecone
-const pc = new Pinecone({
-  apiKey: process.env.PINECONE_API_KEY,
-});
-// Using the index name based on the URL provided (hotel-pms)
-const pineconeIndex = pc.Index('hotel-pms', process.env.PINECONE_URL);
 
 // Simple text chunker
 function chunkText(text, maxChars = 1000) {
@@ -102,23 +95,19 @@ exports.uploadDocument = async (req, res) => {
           dimensions: 1024
         });
 
-        console.log(`[RAG Engine] Saving vectors to Pinecone...`);
-        const pineconeRecords = chunks.map((chunk, i) => ({
+        console.log(`[RAG Engine] Saving vectors to Neon Vector DB...`);
+        const records = chunks.map((chunk, i) => ({
           id: `doc_${newDoc.id}_chunk_${i}`,
-          values: embeddingsResponse.data[i].embedding,
-          metadata: {
-            documentId: newDoc.id,
-            hotelId: hotelId,
-            content: chunk
-          }
+          documentId: newDoc.id,
+          hotelId: hotelId,
+          content: chunk,
+          embedding: embeddingsResponse.data[i].embedding
         }));
 
-        // Upsert to Pinecone
-        console.log(`[RAG Engine] pineconeRecords:`, JSON.stringify(pineconeRecords));
-        if (!pineconeRecords || pineconeRecords.length === 0) {
-          throw new Error('No pinecone records generated to upsert.');
+        if (!records || records.length === 0) {
+          throw new Error('No records generated to upsert.');
         }
-        await pineconeIndex.upsert({ records: pineconeRecords });
+        await vectorDb.upsertEmbeddings(records);
 
         await prisma.knowledgeDocument.update({
           where: { id: newDoc.id },
@@ -161,15 +150,17 @@ exports.queryKnowledge = async (req, res) => {
     
     const queryVector = queryEmbeddingResponse.data[0].embedding;
 
-    // 2. Perform similarity search in Pinecone
-    const queryResponse = await pineconeIndex.query({
-      topK: 3,
-      vector: queryVector,
-      includeMetadata: true,
-      includeValues: false
-    });
+    // 2. Perform similarity search in Neon Vector DB
+    let hotelId = req.user?.hotelId;
+    if (!hotelId) {
+      const hotel = await prisma.hotel.findFirst();
+      if (hotel) hotelId = hotel.id;
+    }
+    hotelId = hotelId ? parseInt(hotelId, 10) : 13;
 
-    const results = queryResponse.matches.map(match => ({
+    const matches = await vectorDb.querySimilarEmbeddings(queryVector, hotelId, 3);
+
+    const results = matches.map(match => ({
       source: `Document ID: ${match.metadata?.documentId || 'Unknown'}`,
       content: match.metadata?.content || '',
       confidence: match.score?.toFixed(2) || 0
@@ -193,6 +184,8 @@ exports.queryKnowledge = async (req, res) => {
 exports.deleteDocument = async (req, res) => {
   try {
     const { id } = req.params;
+    
+    await vectorDb.deleteDocumentEmbeddings(parseInt(id, 10));
     
     await prisma.knowledgeDocument.delete({
       where: { id: parseInt(id) }

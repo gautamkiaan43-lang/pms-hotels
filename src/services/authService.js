@@ -312,6 +312,38 @@ const getUserById = async (userId) => {
   };
 };
 
+const changePassword = async (userId, currentPassword, newPassword) => {
+  if (!validatePassword(newPassword)) {
+    const error = new Error('Password must be at least 8 characters long and contain uppercase, lowercase, number, and special character');
+    error.statusCode = 400;
+    throw error;
+  }
+
+  const user = await prisma.user.findUnique({
+    where: { id: parseInt(userId) }
+  });
+  if (!user) {
+    const error = new Error('User not found');
+    error.statusCode = 404;
+    throw error;
+  }
+
+  const isMatch = await bcrypt.compare(currentPassword, user.password);
+  if (!isMatch) {
+    const error = new Error('Incorrect current password');
+    error.statusCode = 400;
+    throw error;
+  }
+
+  const hashedPassword = await bcrypt.hash(newPassword, 10);
+  await prisma.user.update({
+    where: { id: user.id },
+    data: { password: hashedPassword }
+  });
+
+  return { message: 'Password updated successfully' };
+};
+
 module.exports = {
   login,
   logout,
@@ -322,5 +354,6 @@ module.exports = {
   getUsers,
   updateUserRole,
   deleteUser,
-  getUserById
+  getUserById,
+  changePassword
 };

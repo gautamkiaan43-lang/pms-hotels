@@ -34,4 +34,7 @@ router.delete('/users/:id', requireAuth, authController.deleteUser);
 // GET /api/auth/me
 router.get('/me', requireAuth, authController.getMe);
 
+// POST /api/auth/change-password
+router.post('/change-password', requireAuth, authController.changePassword);
+
 module.exports = router;

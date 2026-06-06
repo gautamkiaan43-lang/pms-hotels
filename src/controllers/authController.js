@@ -134,6 +134,17 @@ const getMe = asyncHandler(async (req, res) => {
   return sendSuccess(res, 200, { user });
 });
 
+const changePassword = asyncHandler(async (req, res) => {
+  const { currentPassword, newPassword } = req.body;
+  if (!currentPassword || !newPassword) {
+    const error = new Error('Current password and new password are required');
+    error.statusCode = 400;
+    throw error;
+  }
+  const result = await authService.changePassword(req.user.id, currentPassword, newPassword);
+  return sendSuccess(res, 200, result);
+});
+
 module.exports = {
   login,
   register,
@@ -144,5 +155,6 @@ module.exports = {
   getUsers,
   updateUserRole,
   deleteUser,
-  getMe
+  getMe,
+  changePassword
 };

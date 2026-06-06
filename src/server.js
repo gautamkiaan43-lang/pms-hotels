@@ -1,6 +1,8 @@
 const app = require('./app');
 const config = require('./config/env');
 const prisma = require('./config/prisma');
+// Trigger restart after prisma client generation
+
 
 const startServer = async () => {
   try {

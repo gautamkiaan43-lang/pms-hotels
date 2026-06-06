@@ -3,7 +3,9 @@ const prisma = new PrismaClient();
 const path = require('path');
 const fs = require('fs');
 const { OpenAI } = require('openai');
-const pdfParse = require('pdf-parse');
+const pdfParse = require('pdf-parse'); // v1.1.1 - exports a function directly
+
+
 const vectorDb = require('../utils/vectorDb');
 
 const openai = new OpenAI({
@@ -66,9 +68,38 @@ exports.uploadDocument = async (req, res) => {
     let textToEmbed = 'This is a placeholder policy document. Gold members get late checkout until 2 PM. Regular checkout is 11 AM.';
     
     if (req.file && req.file.path) {
-      const dataBuffer = fs.readFileSync(req.file.path);
-      const pdfData = await pdfParse(dataBuffer);
-      textToEmbed = pdfData.text;
+      try {
+        const dataBuffer = fs.readFileSync(req.file.path);
+        let pdfData;
+        try {
+          // Try default parser first
+          pdfData = await pdfParse(dataBuffer);
+        } catch (parseErr) {
+          // If XRef/FormatError, retry with v2.0.550 which re-indexes all objects
+          const isXRefError = parseErr.message?.includes('XRef') || parseErr.message?.includes('FormatError');
+          if (isXRefError) {
+            console.warn(`[RAG Engine] Default parser failed (${parseErr.message}). Retrying with v2.0.550 fallback...`);
+            pdfData = await pdfParse(dataBuffer, { version: 'v2.0.550' });
+          } else {
+            throw parseErr;
+          }
+        }
+
+        if (!pdfData.text || pdfData.text.trim().length < 20) {
+          fs.unlinkSync(req.file.path);
+          return res.status(400).json({
+            message: 'This PDF appears to be a scanned image (no text layer found). Please upload a text-based PDF or copy-paste the content as a text file.'
+          });
+        }
+        textToEmbed = pdfData.text;
+        console.log(`[RAG Engine] Extracted ${textToEmbed.length} characters from "${req.file.originalname}"`);
+      } catch (pdfError) {
+        try { fs.unlinkSync(req.file.path); } catch(_) {}
+        console.error('[RAG Engine] PDF parse failed:', pdfError.message);
+        return res.status(400).json({
+          message: `Failed to parse PDF: ${pdfError.message}. Please try re-exporting the PDF from your document editor.`
+        });
+      }
     }
 
     // 1. Create DB record for the file in Prisma (MySQL)
@@ -187,7 +218,7 @@ exports.deleteDocument = async (req, res) => {
     
     await vectorDb.deleteDocumentEmbeddings(parseInt(id, 10));
     
-    await prisma.knowledgeDocument.delete({
+    await prisma.knowledgeDocument.deleteMany({
       where: { id: parseInt(id) }
     });
 
@@ -195,5 +226,90 @@ exports.deleteDocument = async (req, res) => {
   } catch (error) {
     console.error('Delete Document Error:', error);
     res.status(500).json({ message: 'Failed to delete document' });
+  }
+};
+
+// Re-index / Sync an existing document back into the vector DB
+exports.reindexDocument = async (req, res) => {
+  try {
+    const { id } = req.params;
+    const doc = await prisma.knowledgeDocument.findUnique({ where: { id: parseInt(id) } });
+    if (!doc) return res.status(404).json({ message: 'Document not found' });
+
+    // Tell the frontend immediately so it doesn't time out
+    res.json({ message: `Re-indexing "${doc.filename}" into AI response rules...` });
+
+    // Run vectorization in background
+    (async () => {
+      try {
+        let textToEmbed = null;
+
+        // Try to read PDF from disk
+        if (doc.fileUrl) {
+          const filename = doc.fileUrl.replace('/uploads/', '');
+          const fullPath = require('path').join(__dirname, '../../uploads', filename);
+          if (fs.existsSync(fullPath)) {
+            try {
+              const buffer = fs.readFileSync(fullPath);
+              let pdfData;
+              try {
+                pdfData = await pdfParse(buffer);
+              } catch (e) {
+                if (e.message?.includes('XRef') || e.message?.includes('FormatError')) {
+                  console.warn(`[RAG Re-index] XRef error, retrying with v2.0.550...`);
+                  pdfData = await pdfParse(buffer, { version: 'v2.0.550' });
+                } else throw e;
+              }
+              if (pdfData?.text?.trim().length > 20) {
+                textToEmbed = pdfData.text;
+                console.log(`[RAG Re-index] Read ${textToEmbed.length} chars from disk for "${doc.filename}"`);
+              }
+            } catch (e) {
+              console.warn(`[RAG Re-index] Could not parse PDF: ${e.message}`);
+            }
+          }
+        }
+
+        // Fallback to placeholder if file not on disk
+        if (!textToEmbed) {
+          textToEmbed = `Hotel document: ${doc.filename}. This document contains hotel policies and operational procedures.`;
+          console.warn(`[RAG Re-index] PDF not on disk, using minimal placeholder for doc ${id}`);
+        }
+
+        // Delete old embeddings for this document
+        await vectorDb.deleteDocumentEmbeddings(doc.id);
+
+        // Re-chunk and re-embed
+        const chunks = chunkText(textToEmbed);
+        const embeddingsResponse = await openai.embeddings.create({
+          model: "text-embedding-3-small",
+          input: chunks,
+          dimensions: 1024
+        });
+
+        const records = chunks.map((chunk, i) => ({
+          id: `doc_${doc.id}_chunk_${i}`,
+          documentId: doc.id,
+          hotelId: doc.hotelId,
+          content: chunk,
+          embedding: embeddingsResponse.data[i].embedding
+        }));
+
+        await vectorDb.upsertEmbeddings(records);
+
+        await prisma.knowledgeDocument.update({
+          where: { id: doc.id },
+          data: { isVectorized: true, vectorCount: chunks.length }
+        });
+
+        console.log(`[RAG Re-index] "${doc.filename}" re-indexed with ${chunks.length} chunks.`);
+      } catch (err) {
+        console.error(`[RAG Re-index] Error re-indexing doc ${id}:`, err.message);
+      }
+    })();
+
+  } catch (error) {
+    console.error('Reindex Document Error:', error);
+    res.status(500).json({ message: 'Failed to re-index document' });
   }
 };

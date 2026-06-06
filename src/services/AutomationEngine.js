@@ -206,13 +206,21 @@ class AutomationEngine {
 
     const ALLOWLIST = TOOLS_SCHEMA.map(t => t.function.name);
 
-    const systemPrompt = `You are a zero-trust Hotel AI Concierge.
-All state-changing operations are backend-authoritative. You are a request generator only.
-Never assume availability, pricing, or booking success.
-Categories:
-A: Information - Use query_hotel_knowledge_base.
-B: Operations - Execute exact tools to check availability, create reservations, or retrieve balances.
-C: Ambiguous - Ask for clarification.`;
+    const systemPrompt = `You are a Hotel AI Concierge for a luxury hotel. Your job is to help guests with information and requests.
+
+INFORMATION REQUESTS (Category A):
+- When a guest asks about hotel policies, checkout times, check-in, breakfast, wifi, cancellations, pets, or any hotel information, ALWAYS call query_hotel_knowledge_base first.
+- After calling query_hotel_knowledge_base, use the returned content to give the guest a clear, helpful, and complete answer. Do NOT say you couldn't find the information if the tool returned content.
+- If the tool explicitly returns "No specific policy found.", only then say you don't have that specific information.
+
+OPERATIONS (Category B):
+- For booking rooms, checking availability, creating/modifying/cancelling reservations, checking in, checking out, viewing bills, making payments — use the exact operational tools.
+- Never assume or invent booking availability, pricing, or reservation success. Always call the appropriate tool and report back the actual result.
+
+ESCALATION (Category C):
+- Escalate to a human agent for disputes, refunds, complex complaints, or anything requiring management approval.
+
+ALWAYS respond in a warm, professional, concise hotel concierge tone. Use the information from tools to give confident, direct answers.`;
 
     const dbHistory = await conversationService.getRecentMessages(conversation.id, 50);
     const formattedHistory = [];
@@ -354,14 +362,25 @@ C: Ambiguous - Ask for clarification.`;
     try {
       const q = await openai.embeddings.create({ model: "text-embedding-3-small", input: args.search_query, dimensions: 1024 });
       const vector = q.data[0].embedding;
-      const matches = await vectorDb.querySimilarEmbeddings(vector, hotelId, 3);
-      if (matches.length > 0) return { status: "success", data: matches.map(m => m.metadata.content).join("\n") };
+      const matches = await vectorDb.querySimilarEmbeddings(vector, hotelId, 6);
+      if (matches.length > 0) {
+        // Deduplicate by content prefix to avoid sending same chunk multiple times
+        const seen = new Set();
+        const uniqueChunks = matches.filter(m => {
+          const key = m.metadata.content.substring(0, 100);
+          if (seen.has(key)) return false;
+          seen.add(key);
+          return true;
+        });
+        return { status: "success", data: uniqueChunks.map(m => m.metadata.content).join("\n\n---\n\n") };
+      }
       return { status: "success", data: "No specific policy found." };
     } catch (e) { 
       console.error('[Automation Engine] RAG query failed:', e);
       return { status: "error", message: "Knowledge base error." }; 
     }
   }
+
 
   async _toolGetGuestProfile(hotelId, guest, args, context) {
     if (!guest.pmsGuestId) return { status: "error", message: "No PMS profile." };

@@ -128,8 +128,7 @@ class MewsService {
    */
   async getStayDetails(hotelId, customerId) {
     return this._request(hotelId, '/reservations/getAll', {
-      CustomerIds: [customerId],
-      States: ['Confirmed', 'CheckedIn', 'CheckedOut']
+      CustomerIds: [customerId]
     });
   }
 
@@ -265,7 +264,7 @@ class MewsService {
    * 12. Get Folio Balance (Unpaid items)
    */
   async getFolioBalance(hotelId, customerId) {
-    return this._request(hotelId, '/finance/items/getAll', {
+    return this._request(hotelId, '/accountingItems/getAll', {
       CustomerIds: [customerId],
       States: ['Unpaid']
     });

@@ -1,13 +1,19 @@
 const { PrismaClient } = require('@prisma/client');
 const prisma = new PrismaClient();
 
+// Helper: resolve the correct hotelId from user session OR fall back to first hotel in DB
+async function resolveHotelId(req) {
+  if (req.user?.hotelId) return parseInt(req.user.hotelId, 10);
+  const hotel = await prisma.hotel.findFirst({ orderBy: { id: 'asc' } });
+  if (!hotel) throw new Error('No hotel found in database');
+  return hotel.id;
+}
+
 // Get all workflows for a hotel
 exports.getWorkflows = async (req, res) => {
   try {
-    const hotelId = req.user?.hotelId || 5; // Fallback to 5 since only hotel 5 exists
-    const workflows = await prisma.workflow.findMany({
-      where: { hotelId }
-    });
+    const hotelId = await resolveHotelId(req);
+    const workflows = await prisma.workflow.findMany({ where: { hotelId } });
     res.json(workflows);
   } catch (error) {
     console.error('Get Workflows Error:', error);
@@ -18,7 +24,7 @@ exports.getWorkflows = async (req, res) => {
 // Create a new workflow
 exports.createWorkflow = async (req, res) => {
   try {
-    const hotelId = req.user?.hotelId || 5;
+    const hotelId = await resolveHotelId(req);
     const { name, purpose, channel, policySource, escalationTrigger, autoApproveLimit, occupancyThreshold, loyaltyRequired } = req.body;
 
     const newWorkflow = await prisma.workflow.create({

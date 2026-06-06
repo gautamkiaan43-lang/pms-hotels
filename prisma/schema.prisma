@@ -275,6 +275,7 @@ model KnowledgeDocument {
   filename       String
   fileUrl        String   @map("file_url")
   docType        String   @map("doc_type")
+  rawText        String?  @db.LongText @map("raw_text")
   isVectorized   Boolean  @default(false) @map("is_vectorized")
   vectorCount    Int      @default(0) @map("vector_count")
   createdAt      DateTime @default(now()) @map("created_at")

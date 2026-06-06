@@ -4,16 +4,8 @@ const multer = require('multer');
 const path = require('path');
 const ragController = require('../controllers/ragController');
 
-// Multer disk storage: saves PDFs to /uploads folder
-const storage = multer.diskStorage({
-  destination: function (req, file, cb) {
-    cb(null, path.join(__dirname, '../../uploads'));
-  },
-  filename: function (req, file, cb) {
-    const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1e9);
-    cb(null, uniqueSuffix + '-' + file.originalname);
-  }
-});
+// Multer memory storage: holds files in memory buffer instead of writing to disk
+const storage = multer.memoryStorage();
 
 const upload = multer({
   storage,

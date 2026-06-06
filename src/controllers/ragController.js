@@ -67,9 +67,9 @@ exports.uploadDocument = async (req, res) => {
     // In a production app, use multer to handle req.file
     let textToEmbed = 'This is a placeholder policy document. Gold members get late checkout until 2 PM. Regular checkout is 11 AM.';
     
-    if (req.file && req.file.path) {
+    if (req.file && req.file.buffer) {
       try {
-        const dataBuffer = fs.readFileSync(req.file.path);
+        const dataBuffer = req.file.buffer;
         let pdfData;
         try {
           // Try default parser first
@@ -86,15 +86,13 @@ exports.uploadDocument = async (req, res) => {
         }
 
         if (!pdfData.text || pdfData.text.trim().length < 20) {
-          fs.unlinkSync(req.file.path);
           return res.status(400).json({
             message: 'This PDF appears to be a scanned image (no text layer found). Please upload a text-based PDF or copy-paste the content as a text file.'
           });
         }
         textToEmbed = pdfData.text;
-        console.log(`[RAG Engine] Extracted ${textToEmbed.length} characters from "${req.file.originalname}"`);
+        console.log(`[RAG Engine] Extracted ${textToEmbed.length} characters from memory buffer of "${req.file.originalname}"`);
       } catch (pdfError) {
-        try { fs.unlinkSync(req.file.path); } catch(_) {}
         console.error('[RAG Engine] PDF parse failed:', pdfError.message);
         return res.status(400).json({
           message: `Failed to parse PDF: ${pdfError.message}. Please try re-exporting the PDF from your document editor.`
@@ -107,7 +105,8 @@ exports.uploadDocument = async (req, res) => {
       data: {
         hotelId,
         filename: filename || (req.file ? req.file.originalname : 'Unknown_Document.pdf'),
-        fileUrl: req.file ? `/uploads/${req.file.filename}` : `/uploads/${Date.now()}_doc.pdf`,
+        fileUrl: req.file ? `/uploads/in_memory` : `/uploads/${Date.now()}_doc.pdf`,
+        rawText: textToEmbed,
         docType: docType || 'SOP',
         isVectorized: false
       }
@@ -215,11 +214,30 @@ exports.queryKnowledge = async (req, res) => {
 exports.deleteDocument = async (req, res) => {
   try {
     const { id } = req.params;
+    const docId = parseInt(id, 10);
+
+    // Fetch document first to check if there is a physical file on disk to remove
+    const doc = await prisma.knowledgeDocument.findUnique({
+      where: { id: docId }
+    });
+
+    if (doc && doc.fileUrl && !doc.fileUrl.includes('in_memory')) {
+      const filename = doc.fileUrl.replace('/uploads/', '');
+      const fullPath = path.join(__dirname, '../../uploads', filename);
+      if (fs.existsSync(fullPath)) {
+        try {
+          fs.unlinkSync(fullPath);
+          console.log(`[RAG Engine] Deleted physical file: ${fullPath}`);
+        } catch (unlinkErr) {
+          console.warn(`[RAG Engine] Failed to delete local file ${fullPath}:`, unlinkErr.message);
+        }
+      }
+    }
     
-    await vectorDb.deleteDocumentEmbeddings(parseInt(id, 10));
+    await vectorDb.deleteDocumentEmbeddings(docId);
     
     await prisma.knowledgeDocument.deleteMany({
-      where: { id: parseInt(id) }
+      where: { id: docId }
     });
 
     res.json({ message: 'Document deleted successfully' });
@@ -242,38 +260,12 @@ exports.reindexDocument = async (req, res) => {
     // Run vectorization in background
     (async () => {
       try {
-        let textToEmbed = null;
-
-        // Try to read PDF from disk
-        if (doc.fileUrl) {
-          const filename = doc.fileUrl.replace('/uploads/', '');
-          const fullPath = require('path').join(__dirname, '../../uploads', filename);
-          if (fs.existsSync(fullPath)) {
-            try {
-              const buffer = fs.readFileSync(fullPath);
-              let pdfData;
-              try {
-                pdfData = await pdfParse(buffer);
-              } catch (e) {
-                if (e.message?.includes('XRef') || e.message?.includes('FormatError')) {
-                  console.warn(`[RAG Re-index] XRef error, retrying with v2.0.550...`);
-                  pdfData = await pdfParse(buffer, { version: 'v2.0.550' });
-                } else throw e;
-              }
-              if (pdfData?.text?.trim().length > 20) {
-                textToEmbed = pdfData.text;
-                console.log(`[RAG Re-index] Read ${textToEmbed.length} chars from disk for "${doc.filename}"`);
-              }
-            } catch (e) {
-              console.warn(`[RAG Re-index] Could not parse PDF: ${e.message}`);
-            }
-          }
-        }
-
-        // Fallback to placeholder if file not on disk
+        let textToEmbed = doc.rawText;
+        
+        // Fallback to placeholder if file not in DB
         if (!textToEmbed) {
           textToEmbed = `Hotel document: ${doc.filename}. This document contains hotel policies and operational procedures.`;
-          console.warn(`[RAG Re-index] PDF not on disk, using minimal placeholder for doc ${id}`);
+          console.warn(`[RAG Re-index] No rawText stored in DB for doc ${id}, using minimal placeholder`);
         }
 
         // Delete old embeddings for this document

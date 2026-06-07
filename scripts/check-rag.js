@@ -1,7 +1,7 @@
 const { Pinecone } = require('@pinecone-database/pinecone');
 require('dotenv').config({ path: '../Frontend/.env' });
 
-const pc = new Pinecone({ apiKey: process.env.PINECONE_API_KEY || 'pcsk_53R9m7_W3QWcZk8eXy6h7eT2Jb5aJb5aJb5aJb5a' });
+const pc = new Pinecone({ apiKey: process.env.PINECONE_API_KEY || '' });
 
 async function checkPinecone() {
   try {

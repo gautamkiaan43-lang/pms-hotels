@@ -1,3 +1,4 @@
+require('dotenv').config({ path: require('path').resolve(__dirname, '../.env') });
 const mewsService = require('../src/services/mewsService');
 
 async function testRawCredentials() {
@@ -7,9 +8,9 @@ async function testRawCredentials() {
   console.log('1. Testing Mews PMS Connection...');
   const mewsUrl = 'https://api.mews-demo.com/api/connector/v1'; // Assuming demo for now, or production: https://api.mews.com/api/connector/v1
   
-  // The credentials the client provided:
-  const clientToken = "E0D439EE522F44368DC78E1BFB03710C-D24FB11DBE31D4621C4817E028D9E1D";
-  const accessToken = "C66EF7B239D24632943D115EDE9CB810-EA00F8FD8294692C940F6B5A8F9453D";
+  // Read from environment variables
+  const clientToken = process.env.MEWS_CLIENT_TOKEN;
+  const accessToken = process.env.MEWS_ACCESS_TOKEN;
   
   const payload = {
     ClientToken: clientToken,
@@ -52,8 +53,8 @@ async function testRawCredentials() {
   // WhatsApp
   console.log('2. Testing WhatsApp Business API Connection...');
   const phoneId = "1122308060957206";
-  // The token has a suspicious > at the end. Let's try it with and without it.
-  const rawToken = "EAAg20lWBruQBRTsAVp0K1JGkJdJ31SzsTFoNZAqb6gYjJHcVCBIkAKGYAshYJKm>";
+  // Read from environment variables
+  const rawToken = process.env.WHATSAPP_TOKEN || "";
   const cleanedToken = rawToken.replace('>', '');
 
   console.log(`   Trying Raw Token: ${rawToken}`);

@@ -1,6 +1,7 @@
+require('dotenv').config({ path: require('path').resolve(__dirname, '../.env') });
 const { PrismaClient } = require('@prisma/client');
 
-const dbUrl = "mysql://root:WGrlinNsREiHfQgMhGsbYAZgcGULqyOQ@zephyr.proxy.rlwy.net:38807/railway";
+const dbUrl = process.env.DATABASE_URL;
 const prisma = new PrismaClient({
   datasources: {
     db: {
@@ -8,6 +9,7 @@ const prisma = new PrismaClient({
     }
   }
 });
+
 
 async function main() {
   console.log("Connecting to live database to clear all guest and chat data...");

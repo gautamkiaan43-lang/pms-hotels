@@ -99,9 +99,24 @@ model Conversation {
   activityLogs    ActivityLog[]
   guest           Guest         @relation(fields: [guestId], references: [id])
   messages        Message[]
+  bookingState    BookingState?
 
   @@index([guestId], map: "conversations_guest_id_fkey")
   @@map("conversations")
+}
+
+model BookingState {
+  conversationId Int      @id @map("conversation_id")
+  checkInDate    DateTime? @map("check_in_date")
+  checkOutDate   DateTime? @map("check_out_date")
+  adults         Int?
+  children       Int?
+  roomType       String?  @map("room_type")
+  selectedRoomId String?  @map("selected_room_id")
+  selectedRateId String?  @map("selected_rate_id")
+  conversation   Conversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+
+  @@map("booking_states")
 }
 
 model Message {
@@ -112,6 +127,8 @@ model Message {
   toolCalls      Json?        @map("tool_calls")
   toolCallId     String?      @map("tool_call_id")
   channel        String       @default("WhatsApp")
+  emailMessageId String?      @map("email_message_id")
+  emailInReplyTo String?      @map("email_in_reply_to")
   createdAt      DateTime     @default(now()) @map("created_at")
   conversation   Conversation @relation(fields: [conversationId], references: [id])
 
@@ -180,6 +197,7 @@ model Hotel {
   aiStatus            String   @default("Active") @map("ai_status")
   createdBy           String?  @map("created_by")
   emailConnected      Boolean  @default(false) @map("email_connected")
+  emailIntegrationType String  @default("SMTP") @map("email_integration_type")
   hotelCode           String?  @map("hotel_code")
   hotelEmail          String?  @map("hotel_email")
   hotelName           String   @map("hotel_name")
@@ -195,6 +213,8 @@ model Hotel {
   whatsappPhoneId     String?  @map("whatsapp_phone_id")
   whatsappAppSecret   String?  @map("whatsapp_app_secret") @db.Text
   whatsappVerifyToken String?  @map("whatsapp_verify_token")
+  whatsappHealthStatus String  @default("ok") @map("whatsapp_health_status")
+  whatsappHealthNote  String?  @map("whatsapp_health_note") @db.Text
   smtpHost            String?  @map("smtp_host")
   smtpPort            Int?     @map("smtp_port")
   smtpUser            String?  @map("smtp_user")

@@ -2,6 +2,7 @@ const mewsService = require('./mewsService');
 const guestService = require('./guestService');
 const conversationService = require('./conversationService');
 const whatsappService = require('./whatsappService');
+const emailService = require('./emailService');
 const { PrismaClient } = require('@prisma/client');
 const prisma = new PrismaClient();
 const { OpenAI } = require('openai');
@@ -106,7 +107,7 @@ class AutomationEngine {
   // ==========================================
   // INGESTION PIPELINE
   // ==========================================
-  async handleIncomingMessage(hotelId, senderIdentity, content, channel = 'WhatsApp') {
+  async handleIncomingMessage(hotelId, senderIdentity, content, channel = 'WhatsApp', emailMessageId = null, emailInReplyTo = null) {
     if (!hotelId) throw new Error("hotelId is required for AutomationEngine");
 
     // 1. Identify guest
@@ -130,7 +131,8 @@ class AutomationEngine {
     if (!guest) {
       guest = await guestService.createGuest({
         name: 'Unknown Guest',
-        phone: senderIdentity,
+        phone: channel === 'Email' ? 'No Phone' : senderIdentity,
+        email: channel === 'Email' ? senderIdentity : null,
         status: 'Unidentified'
       });
     }
@@ -139,8 +141,13 @@ class AutomationEngine {
     const conversation = await conversationService.findOrCreateConversation(guest.id);
     
     // 3. Store Message
-    await conversationService.addMessage(conversation.id, 'guest', content, channel);
+    await conversationService.addMessage(conversation.id, 'guest', content, channel, null, null, emailMessageId, emailInReplyTo);
     await conversationService.logActivity(conversation.id, 'Message Received', `Channel: ${channel}`);
+
+    if (!conversation.aiEnabled || conversation.status === 'escalated') {
+      console.log(`[AutomationEngine] AI response bypassed: conversation ${conversation.id} is managed by human.`);
+      return { success: true, message: 'Message logged. Managed by human operator.', automated: false };
+    }
 
     // 4. Decision Logic (OpenAI)
     try {
@@ -152,18 +159,51 @@ class AutomationEngine {
           console.warn(`[AutomationEngine] AI returned empty response for Hotel ${hotelId}. Skipping message dispatch.`);
           return { success: false, error: 'AI returned empty response' };
         }
-        await conversationService.addMessage(conversation.id, 'ai', decision.response, channel);
-        await conversationService.logActivity(conversation.id, 'AI Response', `Tool Used: ${decision.tool || 'none'}`);
         
-        if (channel === 'WhatsApp') {
+        let outEmailMsgId = null;
+        if (channel === 'Email') {
+          try {
+            const subject = `Inquiry regarding your stay`;
+            const info = await emailService.sendGuestEmail(guest.email || senderIdentity, subject, `<p>${decision.response.replace(/\n/g, '<br>')}</p>`, emailMessageId, emailMessageId, hotelId);
+            outEmailMsgId = info?.messageId || null;
+          } catch (err) {
+            console.error('Failed to dispatch Email message:', err.message);
+          }
+        } else if (channel === 'WhatsApp') {
           try { await whatsappService.sendMessage(hotelId, guest.phone, decision.response); } 
           catch (err) { console.error('Failed to dispatch WhatsApp message:', err.message); }
         }
+
+        await conversationService.addMessage(conversation.id, 'ai', decision.response, channel, null, null, outEmailMsgId, emailMessageId);
+        await conversationService.logActivity(conversation.id, 'AI Response', `Tool Used: ${decision.tool || 'none'}`);
+        
         return { success: true, response: decision.response, automated: true };
       } else {
         await conversationService.updateStatus(conversation.id, 'escalated', 0);
         await conversationService.logActivity(conversation.id, 'Escalation', `Reason: ${decision.reason}`);
-        return { success: true, message: 'Escalated to human operator', automated: false };
+        
+        const handoffMessage = "I am transferring your request to a human operator. A staff member will review this and get back to you shortly.";
+        let outEmailMsgId = null;
+
+        if (channel === 'Email') {
+          try {
+            const subject = `Transferring to Guest Services`;
+            const info = await emailService.sendGuestEmail(guest.email || senderIdentity, subject, `<p>${handoffMessage}</p>`, emailMessageId, emailMessageId, hotelId);
+            outEmailMsgId = info?.messageId || null;
+          } catch (err) {
+            console.error('Failed to dispatch Escalation Email message:', err.message);
+          }
+        } else if (channel === 'WhatsApp') {
+          try {
+            await whatsappService.sendMessage(hotelId, guest.phone, handoffMessage);
+          } catch (err) {
+            console.error('Failed to dispatch Escalation WhatsApp message:', err.message);
+          }
+        }
+
+        await conversationService.addMessage(conversation.id, 'ai', handoffMessage, channel, null, null, outEmailMsgId, emailMessageId);
+
+        return { success: true, response: handoffMessage, automated: false };
       }
     } catch (error) {
       console.error('Automation Engine AI Error:', error);
@@ -176,6 +216,10 @@ class AutomationEngine {
   // DISPATCHER & OPENAI ORCHESTRATION
   // ==========================================
   async _decideWithAI(hotelId, conversation, guest, content, channel) {
+    const bookingState = await prisma.bookingState.findUnique({
+      where: { conversationId: conversation.id }
+    });
+
     const TOOLS_SCHEMA = [
       { type: "function", function: { name: "escalate_to_human", description: "Escalate to human.", parameters: { type: "object", properties: { reason: { type: "string" } }, required: ["reason"] } } },
       { type: "function", function: { name: "query_hotel_knowledge_base", description: "Search policies.", parameters: { type: "object", properties: { search_query: { type: "string" } }, required: ["search_query"] } } },
@@ -201,10 +245,40 @@ class AutomationEngine {
       { type: "function", function: { name: "get_folio_balance", description: "Get outstanding balance.", parameters: { type: "object", properties: {} } } },
       { type: "function", function: { name: "send_payment_link", description: "Generate payment link.", parameters: { type: "object", properties: { amount: { type: "number" } }, required: ["amount"] } } },
       { type: "function", function: { name: "amend_payment", description: "Amend a payment.", parameters: { type: "object", properties: { paymentId: { type: "string" } }, required: ["paymentId"] } } },
-      { type: "function", function: { name: "post_charge", description: "Post a charge.", parameters: { type: "object", properties: { serviceId: { type: "string" }, amount: { type: "number" } }, required: ["serviceId", "amount"] } } }
+      { type: "function", function: { name: "post_charge", description: "Post a charge.", parameters: { type: "object", properties: { serviceId: { type: "string" }, amount: { type: "number" } }, required: ["serviceId", "amount"] } } },
+      {
+        type: "function",
+        function: {
+          name: "update_booking_state",
+          description: "Update the structured booking state parameters. Call this whenever the guest provides or updates their check-in/out dates, guest count, room type, or selected room/rate IDs.",
+          parameters: {
+            type: "object",
+            properties: {
+              checkInDate: { type: "string", description: "ISO 8601 UTC date string (e.g. 2026-06-18T15:00:00Z)" },
+              checkOutDate: { type: "string", description: "ISO 8601 UTC date string (e.g. 2026-06-20T11:00:00Z)" },
+              adults: { type: "integer" },
+              children: { type: "integer" },
+              roomType: { type: "string" },
+              selectedRoomId: { type: "string" },
+              selectedRateId: { type: "string" }
+            }
+          }
+        }
+      }
     ];
 
     const ALLOWLIST = TOOLS_SCHEMA.map(t => t.function.name);
+
+    const activeBookingStateText = bookingState ? `
+CURRENT ACTIVE BOOKING STATE (Use these parameters for booking/availability search tools. Do not prompt the guest for these if they are already present here, unless they wish to change them):
+- Check-in Date: ${bookingState.checkInDate ? bookingState.checkInDate.toISOString() : 'Not provided'}
+- Check-out Date: ${bookingState.checkOutDate ? bookingState.checkOutDate.toISOString() : 'Not provided'}
+- Adults: ${bookingState.adults || 'Not provided'}
+- Children: ${bookingState.children || 0}
+- Room Type: ${bookingState.roomType || 'Not provided'}
+- Selected Room ID: ${bookingState.selectedRoomId || 'Not provided'}
+- Selected Rate ID: ${bookingState.selectedRateId || 'Not provided'}
+` : '';
 
     const systemPrompt = `You are a Hotel AI Concierge for a luxury hotel. Your job is to help guests with information and requests.
 
@@ -220,7 +294,8 @@ OPERATIONS (Category B):
 ESCALATION (Category C):
 - Escalate to a human agent for disputes, refunds, complex complaints, or anything requiring management approval.
 
-ALWAYS respond in a warm, professional, concise hotel concierge tone. Use the information from tools to give confident, direct answers.`;
+ALWAYS respond in a warm, professional, concise hotel concierge tone. Use the information from tools to give confident, direct answers.
+${activeBookingStateText}`;
 
     const dbHistory = await conversationService.getRecentMessages(conversation.id, 50);
     const formattedHistory = [];
@@ -485,49 +560,77 @@ ALWAYS respond in a warm, professional, concise hotel concierge tone. Use the in
   }
 
   async _toolCreateReservation(hotelId, guest, args, context) {
-    return this._withIdempotency(context.toolCallId, context.conversationId, hotelId, guest.id, "create_reservation", args, async () => {
-      if (!guest.pmsGuestId) throw new Error("Guest not in PMS.");
+    if (!global.activeBookingGuests) {
+      global.activeBookingGuests = new Set();
+    }
+    if (global.activeBookingGuests.has(guest.id)) {
+      throw new Error("A booking request is already in progress for this guest. Please wait.");
+    }
+    global.activeBookingGuests.add(guest.id);
 
-      // Check availability: count existing reservations in that window
-      const window = await mewsService.getArrivalsDepartures(hotelId, args.startDate, args.endDate);
-      const busyCount = (window.Reservations || []).length;
-      console.log(`[Availability] ${busyCount} existing reservations in requested window.`);
+    try {
+      return await this._withIdempotency(context.toolCallId, context.conversationId, hotelId, guest.id, "create_reservation", args, async () => {
+        if (!guest.pmsGuestId) throw new Error("Guest not in PMS.");
 
-      try {
-        await prisma.bookingLock.create({
-          data: { hotelId, serviceId: args.serviceId, startDate: new Date(args.startDate), endDate: new Date(args.endDate), expiresAt: new Date(Date.now() + 60000) }
-        });
-      } catch (e) {
-        throw new Error("Race condition prevented: Inventory currently locked by another process.");
-      }
+        // Check availability: count existing reservations in that window
+        const window = await mewsService.getArrivalsDepartures(hotelId, args.startDate, args.endDate);
+        const busyCount = (window.Reservations || []).length;
+        console.log(`[Availability] ${busyCount} existing reservations in requested window.`);
 
-      try {
-        // Use createRoomReservation which auto-fetches the RateId from Mews
-        const res = await mewsService.createRoomReservation(hotelId, guest.pmsGuestId, args.serviceId, args.startDate, args.endDate);
-        
-        await prisma.activityLog.create({ data: { conversationId: context.conversationId, actionType: "BOOKING_CREATED", actionDetails: JSON.stringify(res) } });
-        await prisma.bookingLock.deleteMany({ where: { hotelId, serviceId: args.serviceId, startDate: new Date(args.startDate), endDate: new Date(args.endDate) } });
-        
-        const reservation = (res.Reservations || [])[0];
-        if (!reservation) throw new Error('Booking created but no reservation data returned.');
-        
-        return { 
-          status: "success", 
-          data: {
-            reservationId: reservation.Id,
-            bookingNumber: reservation.Number,
-            state: reservation.State,
-            checkIn: reservation.StartUtc,
-            checkOut: reservation.EndUtc,
-            guestName: guest.name || 'John Doe'
+        try {
+          await prisma.bookingLock.create({
+            data: { hotelId, serviceId: args.serviceId, startDate: new Date(args.startDate), endDate: new Date(args.endDate), expiresAt: new Date(Date.now() + 60000) }
+          });
+        } catch (e) {
+          throw new Error("Race condition prevented: Inventory currently locked by another process.");
+        }
+
+        const bookingState = await prisma.bookingState.findUnique({ where: { conversationId: context.conversationId } });
+        let rateId = null;
+        if (bookingState) {
+          rateId = bookingState.selectedRateId;
+          if (bookingState.checkInDate && bookingState.checkOutDate) {
+            const bsStart = bookingState.checkInDate.toISOString().substring(0, 10);
+            const bsEnd = bookingState.checkOutDate.toISOString().substring(0, 10);
+            const reqStart = new Date(args.startDate).toISOString().substring(0, 10);
+            const reqEnd = new Date(args.endDate).toISOString().substring(0, 10);
+            
+            if (bsStart !== reqStart || bsEnd !== reqEnd) {
+               throw new Error("Date mismatch detected. The requested booking dates do not match the active session booking dates. Please confirm your dates.");
+            }
           }
-        };
-      } catch (e) {
-        await prisma.activityLog.create({ data: { conversationId: context.conversationId, actionType: "BOOKING_FAILED", actionDetails: e.message } });
-        await prisma.bookingLock.deleteMany({ where: { hotelId, serviceId: args.serviceId, startDate: new Date(args.startDate), endDate: new Date(args.endDate) } });
-        throw e;
-      }
-    });
+        }
+
+        try {
+          // Use createRoomReservation which auto-fetches the RateId from Mews or uses the selected one
+          const res = await mewsService.createRoomReservation(hotelId, guest.pmsGuestId, args.serviceId, args.startDate, args.endDate, rateId);
+          
+          await prisma.activityLog.create({ data: { conversationId: context.conversationId, actionType: "BOOKING_CREATED", actionDetails: JSON.stringify(res) } });
+          await prisma.bookingLock.deleteMany({ where: { hotelId, serviceId: args.serviceId, startDate: new Date(args.startDate), endDate: new Date(args.endDate) } });
+          
+          const reservation = (res.Reservations || [])[0];
+          if (!reservation) throw new Error('Booking created but no reservation data returned.');
+          
+          return { 
+            status: "success", 
+            data: {
+              reservationId: reservation.Id,
+              bookingNumber: reservation.Number,
+              state: reservation.State,
+              checkIn: reservation.StartUtc,
+              checkOut: reservation.EndUtc,
+              guestName: guest.name || 'John Doe'
+            }
+          };
+        } catch (e) {
+          await prisma.activityLog.create({ data: { conversationId: context.conversationId, actionType: "BOOKING_FAILED", actionDetails: e.message } });
+          await prisma.bookingLock.deleteMany({ where: { hotelId, serviceId: args.serviceId, startDate: new Date(args.startDate), endDate: new Date(args.endDate) } });
+          throw e;
+        }
+      });
+    } finally {
+      global.activeBookingGuests.delete(guest.id);
+    }
   }
 
   async _toolModifyReservation(hotelId, guest, args, context) {
@@ -635,7 +738,6 @@ ALWAYS respond in a warm, professional, concise hotel concierge tone. Use the in
       return { status: "error", message: "mewsService.amendPayment not implemented." };
     });
   }
-
   async _toolPostCharge(hotelId, guest, args, context) {
     return this._withIdempotency(context.toolCallId, context.conversationId, hotelId, guest.id, "post_charge", args, async () => {
       if (!guest.pmsGuestId) throw new Error("Guest not in PMS.");
@@ -645,6 +747,25 @@ ALWAYS respond in a warm, professional, concise hotel concierge tone. Use the in
       const res = await mewsService.postCharge(hotelId, guest.pmsGuestId, args.amount, currency, args.serviceId);
       return { status: "success", data: res };
     });
+  }
+
+  async _toolUpdateBookingState(hotelId, guest, args, context) {
+    const updateData = {};
+    if (args.checkInDate) updateData.checkInDate = new Date(args.checkInDate);
+    if (args.checkOutDate) updateData.checkOutDate = new Date(args.checkOutDate);
+    if (args.adults !== undefined) updateData.adults = args.adults;
+    if (args.children !== undefined) updateData.children = args.children;
+    if (args.roomType !== undefined) updateData.roomType = args.roomType;
+    if (args.selectedRoomId !== undefined) updateData.selectedRoomId = args.selectedRoomId;
+    if (args.selectedRateId !== undefined) updateData.selectedRateId = args.selectedRateId;
+
+    const bs = await prisma.bookingState.upsert({
+      where: { conversationId: context.conversationId },
+      update: updateData,
+      create: { conversationId: context.conversationId, ...updateData }
+    });
+
+    return { status: "success", data: bs };
   }
 }
 

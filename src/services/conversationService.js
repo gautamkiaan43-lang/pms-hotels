@@ -32,7 +32,7 @@ class ConversationService {
     return messages.reverse(); // Chronological order
   }
 
-  async addMessage(conversationId, senderType, content, channel = 'WhatsApp', toolCalls = null, toolCallId = null) {
+  async addMessage(conversationId, senderType, content, channel = 'WhatsApp', toolCalls = null, toolCallId = null, emailMessageId = null, emailInReplyTo = null) {
     const data = {
       conversationId,
       senderType,
@@ -41,6 +41,8 @@ class ConversationService {
     };
     if (toolCalls) data.toolCalls = toolCalls;
     if (toolCallId) data.toolCallId = toolCallId;
+    if (emailMessageId) data.emailMessageId = emailMessageId;
+    if (emailInReplyTo) data.emailInReplyTo = emailInReplyTo;
 
     const message = await prisma.message.create({ data });
 

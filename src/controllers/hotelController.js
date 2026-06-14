@@ -9,6 +9,14 @@ const encryptSecrets = (data) => {
   if (data.whatsappApiKey) data.whatsappApiKey = encrypt(data.whatsappApiKey);
   if (data.whatsappAppSecret) data.whatsappAppSecret = encrypt(data.whatsappAppSecret);
   if (data.smtpPass) data.smtpPass = encrypt(data.smtpPass);
+  if (data.smtpPort !== undefined && data.smtpPort !== null) {
+    data.smtpPort = parseInt(data.smtpPort, 10);
+  }
+  // Reset health status on config update
+  if (data.whatsappApiKey || data.whatsappAppSecret || data.whatsappPhoneId || data.whatsappVerifyToken) {
+    data.whatsappHealthStatus = 'ok';
+    data.whatsappHealthNote = null;
+  }
   return data;
 };
 

@@ -22,7 +22,7 @@ class EmailService {
    */
   async sendOnboardingInvite(email, hotelName, token) {
     const onboardingUrl = `http://localhost:5173/onboarding/${token}`;
-    
+
     const mailOptions = {
       from: '"AutoPilot Onboarding" <onboarding@autopilot.ai>',
       to: email,
@@ -46,7 +46,7 @@ class EmailService {
     try {
       // For development/demo purposes, we log the URL if SMTP isn't fully configured
       console.log(`[EMAIL DISPATCH] Invitation sent to ${email}. URL: ${onboardingUrl}`);
-      
+
       // If we are using Ethereal (default/demo), we can get the test URL
       const info = await this.transporter.sendMail(mailOptions);
       if (this.transporter.options.host.includes('ethereal.email')) {
@@ -64,7 +64,7 @@ class EmailService {
    */
   async sendActivationSuccess(email, hotelName, credentials) {
     const loginUrl = `http://localhost:5173/login`;
-    
+
     const mailOptions = {
       from: '"AutoPilot System" <noreply@autopilot.ai>',
       to: email,
@@ -93,6 +93,59 @@ class EmailService {
     } catch (error) {
       console.error('Activation Email Error:', error);
       return false;
+    }
+  }
+
+  async sendGuestEmail(to, subject, htmlBody, references = null, inReplyTo = null, hotelId = null) {
+    let activeTransporter = this.transporter;
+    let fromEmail = process.env.HOTEL_EMAIL_FROM || '"Hotel Guest Services" <guestservices@autopilot.ai>';
+
+    if (hotelId) {
+      try {
+        const { PrismaClient } = require('@prisma/client');
+        const prisma = new PrismaClient();
+        const hotel = await prisma.hotel.findUnique({ where: { id: Number(hotelId) } });
+        if (hotel && hotel.smtpHost && hotel.smtpUser && hotel.smtpPass) {
+          const { decrypt } = require('../utils/cryptoUtils');
+          const decryptedPassword = decrypt(hotel.smtpPass);
+          activeTransporter = nodemailer.createTransport({
+            host: hotel.smtpHost,
+            port: Number(hotel.smtpPort) || 587,
+            secure: Number(hotel.smtpPort) === 465,
+            auth: {
+              user: hotel.smtpUser,
+              pass: decryptedPassword,
+            },
+          });
+          fromEmail = `"${hotel.hotelName || 'Hotel Guest Services'}" <${hotel.smtpUser}>`;
+          console.log(`[EMAIL DISPATCH] Using database SMTP configuration for Hotel ${hotelId} (${hotel.smtpUser})`);
+        }
+      } catch (err) {
+        console.error(`[EMAIL DISPATCH] Failed to initialize hotel-specific SMTP transporter for Hotel ${hotelId}, falling back to default:`, err.message);
+      }
+    }
+
+    const mailOptions = {
+      from: fromEmail,
+      to,
+      subject,
+      html: htmlBody
+    };
+
+    if (references) {
+      mailOptions.headers = {
+        'References': references,
+        'In-Reply-To': inReplyTo || references
+      };
+    }
+
+    try {
+      const info = await activeTransporter.sendMail(mailOptions);
+      console.log(`[EMAIL DISPATCH] Guest email sent to ${to}. Subject: ${subject}`);
+      return info;
+    } catch (error) {
+      console.error('Guest Email Dispatch Error:', error);
+      throw error;
     }
   }
 }

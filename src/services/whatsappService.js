@@ -49,7 +49,27 @@ class WhatsAppService {
       const result = await response.json();
 
       if (!response.ok) {
-        throw new Error(result.error?.message || `WhatsApp API Error: ${response.status}`);
+        const errMsg = result.error?.message || `WhatsApp API Error: ${response.status}`;
+        // Detect token expiry / invalid token and flag in DB
+        if (result.error?.code === 190 || errMsg.toLowerCase().includes('token') || errMsg.toLowerCase().includes('oauth')) {
+          await prisma.hotel.update({
+            where: { id: hotelId },
+            data: {
+              whatsappHealthStatus: 'token_invalid',
+              whatsappHealthNote: 'Access Token is expired or invalid. Please generate a new token from Meta Developer Console → WhatsApp → API Setup and update it in your WhatsApp settings.'
+            }
+          });
+          console.error(`[WhatsApp] ❌ Token invalid for Hotel ${hotelId}. Health status updated.`);
+        }
+        throw new Error(errMsg);
+      }
+
+      // Token is working — clear any previous token error
+      if (hotel.whatsappHealthStatus === 'token_invalid') {
+        await prisma.hotel.update({
+          where: { id: hotelId },
+          data: { whatsappHealthStatus: 'ok', whatsappHealthNote: null }
+        });
       }
 
       return result;

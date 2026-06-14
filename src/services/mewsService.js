@@ -188,25 +188,29 @@ class MewsService {
   /**
    * 8. Create Room Reservation (fetches first available rate automatically)
    */
-  async createRoomReservation(hotelId, customerId, serviceId, startUtc, endUtc) {
-    // Fetch first active rate for this service
-    const ratesRes = await this._request(hotelId, '/rates/getAll', {
-      ServiceIds: [serviceId]
-    });
-    const rates = (ratesRes.Rates || []);
-    if (rates.length === 0) throw new Error('No rate plans found for this room service.');
-    
-    // Prefer "Fully Flexible" or "No-Flex", otherwise use first rate
-    const preferred = rates.find(r => r.Name === 'Fully Flexible') || rates.find(r => r.Name === 'No-Flex') || rates[0];
-    const rateId = preferred.Id;
-    
-    console.log(`Using rate: "${preferred.Name}" [${rateId}]`);
+  async createRoomReservation(hotelId, customerId, serviceId, startUtc, endUtc, rateId = null) {
+    let finalRateId = rateId;
+    if (!finalRateId) {
+      // Fetch first active rate for this service
+      const ratesRes = await this._request(hotelId, '/rates/getAll', {
+        ServiceIds: [serviceId]
+      });
+      const rates = (ratesRes.Rates || []);
+      if (rates.length === 0) throw new Error('No rate plans found for this room service.');
+      
+      // Prefer "Fully Flexible" or "No-Flex", otherwise use first rate
+      const preferred = rates.find(r => r.Name === 'Fully Flexible') || rates.find(r => r.Name === 'No-Flex') || rates[0];
+      finalRateId = preferred.Id;
+      console.log(`Using auto-selected rate: "${preferred.Name}" [${finalRateId}]`);
+    } else {
+      console.log(`Using explicit rate: [${finalRateId}]`);
+    }
     
     return this._request(hotelId, '/reservations/add', {
       Reservations: [{
         CustomerId: customerId,
         ServiceId: serviceId,
-        RateId: rateId,
+        RateId: finalRateId,
         StartUtc: startUtc,
         EndUtc: endUtc
       }]
